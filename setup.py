@@ -8,6 +8,7 @@ ext_modules = [
         sources=[
             "buckthorn/_core.pyx",
             "buckthorn/c_src/bt_http.c",
+            "buckthorn/c_src/bt_params.c",
             "buckthorn/c_vendor/picohttpparser.c",
             "buckthorn/c_vendor/rax.c",
         ],
@@ -31,7 +32,7 @@ ext_modules = [
 
 setup(
     name="buckthorn",
-    version="0.1.0",
+    version="0.2.0",
     packages=find_packages(),
     ext_modules=cythonize(
         ext_modules,
@@ -41,6 +42,6 @@ setup(
             "wraparound": False,
             "cdivision": True,
         },
-        annotate=True,  # Generates buckthorn/_core.html to inspect C vs Python lines
+        annotate=True,
     ),
 )

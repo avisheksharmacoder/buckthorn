@@ -23,8 +23,29 @@ static const char *RESP_500 =
     "Connection: close\r\n\r\n"
     "Internal Server Error";
 
+static size_t split_url_segments(const char *path, size_t path_len, bt_slice_t *out_segs) {
+    size_t count = 0;
+    const char *cur = path;
+    const char *end = path + path_len;
+    while (cur < end && *cur == '/') cur++;
+
+    while (cur < end && count < BT_MAX_PATH_SEGMENTS) {
+        const char *slash = (const char *)memchr(cur, '/', (size_t)(end - cur));
+        const char *seg_end = slash ? slash : end;
+        if (seg_end > cur) {
+            out_segs[count].ptr = cur;
+            out_segs[count].len = (size_t)(seg_end - cur);
+            out_segs[count].found = 1;
+            count++;
+        }
+        if (!slash) break;
+        cur = slash + 1;
+    }
+    return count;
+}
+
 bt_router_t *bt_router_create(bt_handler_invoke_fn invoke_cb) {
-    bt_router_t *r = (bt_router_t *)malloc(sizeof(bt_router_t));
+    bt_router_t *r = (bt_router_t *)calloc(1, sizeof(bt_router_t));
     if (!r) return NULL;
     r->tree = raxNew();
     r->invoke_cb = invoke_cb;
@@ -39,9 +60,30 @@ void bt_router_destroy(bt_router_t *router) {
 
 int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
                      const char *path, size_t path_len, void *handler_obj) {
+    /* If route contains '{', register in parameterized C segment matcher */
+    if (memchr(path, '{', path_len) != NULL) {
+        if (router->num_param_routes >= BT_MAX_PARAM_ROUTES) return -1;
+        bt_param_route_t *pr = &router->param_routes[router->num_param_routes++];
+        memcpy(pr->method, method, method_len);
+        pr->method[method_len] = '\0';
+        pr->method_len = method_len;
+        pr->handler_obj = handler_obj;
+
+        bt_slice_t segs[BT_MAX_PATH_SEGMENTS];
+        pr->num_segments = split_url_segments(path, path_len, segs);
+        for (size_t i = 0; i < pr->num_segments; i++) {
+            pr->segments[i].seg_len = segs[i].len;
+            memcpy(pr->segments[i].seg_str, segs[i].ptr, segs[i].len);
+            pr->segments[i].seg_str[segs[i].len] = '\0';
+            pr->segments[i].is_param = (segs[i].len > 2 && segs[i].ptr[0] == '{' &&
+                                        segs[i].ptr[segs[i].len - 1] == '}') ? 1 : 0;
+        }
+        return 0;
+    }
+
+    /* Static route fast path -> insert directly into Redis rax radix tree */
     unsigned char key[512];
     if (method_len + 1 + path_len >= sizeof(key)) return -1;
-
     memcpy(key, method, method_len);
     key[method_len] = ':';
     memcpy(key + method_len + 1, path, path_len);
@@ -49,6 +91,46 @@ int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
 
     raxInsert(router->tree, key, key_len, handler_obj, NULL);
     return 0;
+}
+
+static void *bt_match_param_route(
+    bt_router_t *router,
+    const char *method, size_t method_len,
+    const char *path, size_t path_len,
+    bt_slice_t *out_params, size_t *out_num_params
+) {
+    *out_num_params = 0;
+    if (router->num_param_routes == 0) return raxNotFound;
+
+    bt_slice_t req_segs[BT_MAX_PATH_SEGMENTS];
+    size_t num_req_segs = split_url_segments(path, path_len, req_segs);
+
+    for (size_t r = 0; r < router->num_param_routes; r++) {
+        bt_param_route_t *pr = &router->param_routes[r];
+        if (pr->num_segments != num_req_segs || pr->method_len != method_len) continue;
+        if (memcmp(pr->method, method, method_len) != 0) continue;
+
+        size_t p_idx = 0;
+        int matched = 1;
+        for (size_t s = 0; s < num_req_segs; s++) {
+            if (pr->segments[s].is_param) {
+                if (p_idx < BT_MAX_PATH_PARAMS) {
+                    out_params[p_idx++] = req_segs[s];
+                }
+            } else {
+                if (pr->segments[s].seg_len != req_segs[s].len ||
+                    memcmp(pr->segments[s].seg_str, req_segs[s].ptr, req_segs[s].len) != 0) {
+                    matched = 0;
+                    break;
+                }
+            }
+        }
+        if (matched) {
+            *out_num_params = p_idx;
+            return pr->handler_obj;
+        }
+    }
+    return raxNotFound;
 }
 
 int bt_handle_http_bytes(
@@ -90,7 +172,6 @@ int bt_handle_http_bytes(
         return -1;
     }
 
-    /* Separate path and query string ('?') using zero-copy pointer arithmetic */
     const char *query = NULL;
     size_t query_len = 0;
     size_t clean_path_len = path_len;
@@ -101,7 +182,6 @@ int bt_handle_http_bytes(
         query_len = path_len - clean_path_len - 1;
     }
 
-    /* Build lookup key "METHOD:/clean_path" inside the C Arena */
     size_t key_len = method_len + 1 + clean_path_len;
     unsigned char *lookup_key = (unsigned char *)bt_arena_alloc(arena, key_len);
     if (!lookup_key) return -2;
@@ -110,7 +190,19 @@ int bt_handle_http_bytes(
     lookup_key[method_len] = ':';
     memcpy(lookup_key + method_len + 1, path, clean_path_len);
 
+    bt_slice_t path_params[BT_MAX_PATH_PARAMS];
+    size_t num_path_params = 0;
+
+    /* 1. Try O(K) static route lookup in Redis rax */
     void *handler_obj = raxFind(router->tree, lookup_key, key_len);
+
+    /* 2. Fallback to zero-copy C segment matcher for parameterized routes */
+    if (handler_obj == raxNotFound) {
+        handler_obj = bt_match_param_route(
+            router, method, method_len, path, clean_path_len, path_params, &num_path_params
+        );
+    }
+
     if (handler_obj == raxNotFound) {
         size_t len = strlen(RESP_404);
         memcpy(resp_wire_buf, RESP_404, len);
@@ -126,7 +218,6 @@ int bt_handle_http_bytes(
     const char *body_ptr = raw_req + pret;
     size_t body_len = raw_req_len - (size_t)pret;
 
-    /* Allocate temporary response body buffer inside the C Arena */
     char *handler_out_buf = (char *)bt_arena_alloc(arena, 32 * 1024);
     size_t handler_out_len = 0;
     int status_code = 200;
@@ -137,6 +228,7 @@ int bt_handle_http_bytes(
         path, clean_path_len,
         query, query_len,
         headers, num_headers,
+        path_params, num_path_params,
         body_ptr, body_len,
         handler_out_buf, &handler_out_len,
         &status_code
@@ -154,13 +246,15 @@ int bt_handle_http_bytes(
         return -1;
     }
 
-    /* Format HTTP/1.1 response header + body into resp_wire_buf */
+    const char *status_text = (status_code == 200) ? "OK" :
+                              (status_code == 422) ? "Unprocessable Entity" : "OK";
+
     int hdr_len = snprintf(
         resp_wire_buf, resp_wire_cap,
-        "HTTP/1.1 %d OK\r\n"
+        "HTTP/1.1 %d %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: keep-alive\r\n\r\n",
-        status_code, handler_out_len
+        status_code, status_text, handler_out_len
     );
 
     memcpy(resp_wire_buf + hdr_len, handler_out_buf, handler_out_len);
@@ -170,13 +264,12 @@ int bt_handle_http_bytes(
     out_result->body_ptr = resp_wire_buf + hdr_len;
     out_result->body_len = handler_out_len;
 
-    /* Reset arena offset to 0 immediately after request completes */
     bt_arena_reset(arena);
     return 0;
 }
 
 /* =========================================================================
- * Native libuv TCP Server Glue (per-connection 64KB Arena + Read/Write)
+ * Native libuv TCP Server Glue (Unchanged from Phase 1)
  * ========================================================================= */
 typedef struct {
     uv_tcp_t handle;
@@ -251,7 +344,6 @@ int bt_uv_server_run(bt_router_t *router, const char *host, int port) {
     uv_tcp_init_ex(loop, &server, AF_INET);
     server.data = router;
 
-    /* Enable SO_REUSEPORT on Linux if supported via raw fd */
     uv_os_fd_t fd;
     if (uv_fileno((const uv_handle_t *)&server, &fd) == 0) {
         int opt = 1;
