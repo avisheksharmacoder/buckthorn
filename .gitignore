@@ -1,0 +1,52 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C compilation and Cython shared libraries
+*.o
+*.obj
+*.so
+*.dylib
+*.pyd
+*.a
+
+# Cython generated C files and annotations (preserves c_src/ and c_vendor/)
+buckthorn/_core.c
+buckthorn/*.html
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache
+
+# Logs and runtime artifacts
+*.log
+buckthorn.log
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System files
+.DS_Store
+Thumbs.db
