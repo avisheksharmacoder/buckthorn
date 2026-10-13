@@ -247,6 +247,7 @@ int bt_handle_http_bytes(
     }
 
     const char *status_text = (status_code == 200) ? "OK" :
+                              (status_code == 201) ? "Created" :
                               (status_code == 422) ? "Unprocessable Entity" : "OK";
 
     int hdr_len = snprintf(

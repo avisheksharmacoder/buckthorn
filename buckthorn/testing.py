@@ -1,5 +1,6 @@
 # buckthorn/testing.py
-from typing import Optional
+import json as _py_json
+from typing import Any, Optional
 from buckthorn.app import Buckthorn
 from buckthorn._core import CythonRawTestClient, RawResponse
 
@@ -17,11 +18,16 @@ class RawTestClient:
         path: str,
         headers: Optional[dict[str, str]] = None,
         body: bytes = b"",
+        json: Optional[Any] = None,
     ) -> RawResponse:
+        req_headers = dict(headers) if headers else {}
+        if json is not None:
+            body = _py_json.dumps(json, separators=(",", ":")).encode("utf-8")
+            req_headers.setdefault("Content-Type", "application/json")
+
         hdr_lines = [f"{method.upper()} {path} HTTP/1.1", "Host: localhost"]
-        if headers:
-            for k, v in headers.items():
-                hdr_lines.append(f"{k}: {v}")
+        for k, v in req_headers.items():
+            hdr_lines.append(f"{k}: {v}")
         if body:
             hdr_lines.append(f"Content-Length: {len(body)}")
         raw_head = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8")
@@ -31,9 +37,22 @@ class RawTestClient:
         return self.request("GET", path, headers=headers)
 
     def post(
-        self, path: str, body: bytes = b"", headers: Optional[dict[str, str]] = None
+        self,
+        path: str,
+        body: bytes = b"",
+        headers: Optional[dict[str, str]] = None,
+        json: Optional[Any] = None,
     ) -> RawResponse:
-        return self.request("POST", path, headers=headers, body=body)
+        return self.request("POST", path, headers=headers, body=body, json=json)
+
+    def put(
+        self,
+        path: str,
+        body: bytes = b"",
+        headers: Optional[dict[str, str]] = None,
+        json: Optional[Any] = None,
+    ) -> RawResponse:
+        return self.request("PUT", path, headers=headers, body=body, json=json)
 
     def delete(self, path: str, headers: Optional[dict[str, str]] = None) -> RawResponse:
         return self.request("DELETE", path, headers=headers)

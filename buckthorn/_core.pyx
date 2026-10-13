@@ -4,36 +4,54 @@ from libc.string cimport memcpy
 from libc.stdio cimport snprintf
 from libc.stdint cimport int64_t
 from cpython.bytes cimport PyBytes_AsStringAndSize, PyBytes_FromStringAndSize
-from cpython.unicode cimport PyUnicode_DecodeUTF8
+from cpython.unicode cimport PyUnicode_DecodeUTF8, PyUnicode_AsUTF8AndSize
+from cpython.object cimport PyObject_GenericSetAttr, PyObject_GenericGetAttr
 import inspect
+import json as _py_json
 
 from buckthorn._core cimport (
     phr_header, bt_arena_t, bt_arena_init, bt_arena_destroy,
     bt_slice_t, bt_val_error_t, BT_ERR_NONE,
     bt_find_query_param, bt_find_header, bt_find_cookie,
     bt_parse_int64_checked, bt_parse_double_checked, bt_validate_str_checked,
+    yyjson_val, yyjson_mut_doc, yyjson_mut_val,
+    yyjson_is_null, yyjson_is_bool, yyjson_is_int, yyjson_is_num, yyjson_is_str, yyjson_is_arr,
+    yyjson_get_bool, yyjson_get_sint, yyjson_get_num, yyjson_get_str, yyjson_get_len,
+    yyjson_arr_get_first,
+    yyjson_mut_arr, yyjson_mut_obj, yyjson_mut_sint, yyjson_mut_real,
+    yyjson_mut_bool, yyjson_mut_null, yyjson_mut_strn,
+    yyjson_mut_arr_append, yyjson_mut_obj_add,
+    bt_json_doc_t, bt_json_writer_t, bt_json_parse_obj,
+    bt_json_get_int64_checked, bt_json_get_double_checked,
+    bt_json_get_bool_checked, bt_json_get_str_checked, bt_json_get_raw_field,
+    bt_json_writer_init, bt_json_writer_add_int, bt_json_writer_add_double,
+    bt_json_writer_add_bool, bt_json_writer_add_str, bt_json_writer_add_null,
+    bt_json_writer_finish,
     bt_router_t, bt_raw_response_t,
     bt_router_create, bt_router_destroy, bt_router_insert,
     bt_handle_http_bytes, bt_uv_server_run
 )
 
-# Source Enum Constants
-DEF SRC_PATH    = 1
-DEF SRC_QUERY   = 2
-DEF SRC_HEADER  = 3
-DEF SRC_COOKIE  = 4
-DEF SRC_REQUEST = 5
+# Parameter Source Constants
+DEF SRC_PATH        = 1
+DEF SRC_QUERY       = 2
+DEF SRC_HEADER      = 3
+DEF SRC_COOKIE      = 4
+DEF SRC_REQUEST     = 5
+DEF SRC_BODY_SCHEMA = 6
 
-# Type Enum Constants
+# Parameter / Field Type Constants
 DEF TYPE_INT     = 1
 DEF TYPE_FLOAT   = 2
 DEF TYPE_STR     = 3
 DEF TYPE_REQUEST = 4
+DEF TYPE_BOOL    = 5
+DEF TYPE_LIST    = 6
+DEF TYPE_SCHEMA  = 7
 
 
 @cython.freelist(4096)
 cdef class Request:
-    """Zero-copy Cython wrapper around raw HTTP buffer pointers."""
     cdef const char *_method
     cdef size_t _method_len
     cdef const char *_path
@@ -99,17 +117,115 @@ cdef class Request:
         return None
 
 
+cdef class CompiledFieldSpec:
+    """Pre-compiled C field descriptor for a buckthorn.Schema model."""
+    cdef public str name
+    cdef public bytes b_name
+    cdef const char *_key_ptr
+    cdef size_t _key_len
+    cdef public int field_type  # TYPE_INT, TYPE_FLOAT, TYPE_STR, TYPE_BOOL, TYPE_LIST
+    cdef public bint required
+    cdef public object default_val
+    cdef public bint is_list_default
+
+    cdef public bint has_ge
+    cdef public int64_t int_ge
+    cdef public double float_ge
+
+    cdef public bint has_le
+    cdef public int64_t int_le
+    cdef public double float_le
+
+    cdef public bint has_gt
+    cdef public int64_t int_gt
+    cdef public double float_gt
+
+    cdef public bint has_lt
+    cdef public int64_t int_lt
+    cdef public double float_lt
+
+    cdef public bint has_min_len
+    cdef public size_t min_len
+    cdef public bint has_max_len
+    cdef public size_t max_len
+
+    def __cinit__(
+        self,
+        str name,
+        int field_type,
+        bint required=True,
+        object default_val=None,
+        object ge=None,
+        object le=None,
+        object gt=None,
+        object lt=None,
+        object min_length=None,
+        object max_length=None,
+    ):
+        self.name = name
+        self.b_name = name.encode("utf-8")
+        cdef char *ptr = NULL
+        cdef Py_ssize_t length = 0
+        PyBytes_AsStringAndSize(self.b_name, &ptr, &length)
+        self._key_ptr = <const char *>ptr
+        self._key_len = <size_t>length
+
+        self.field_type = field_type
+        self.required = required
+        self.default_val = default_val
+        self.is_list_default = isinstance(default_val, list)
+
+        self.has_ge = ge is not None
+        if self.has_ge:
+            self.int_ge = <int64_t>int(ge)
+            self.float_ge = <double>float(ge)
+
+        self.has_le = le is not None
+        if self.has_le:
+            self.int_le = <int64_t>int(le)
+            self.float_le = <double>float(le)
+
+        self.has_gt = gt is not None
+        if self.has_gt:
+            self.int_gt = <int64_t>int(gt)
+            self.float_gt = <double>float(gt)
+
+        self.has_lt = lt is not None
+        if self.has_lt:
+            self.int_lt = <int64_t>int(lt)
+            self.float_lt = <double>float(lt)
+
+        self.has_min_len = min_length is not None
+        if self.has_min_len:
+            self.min_len = <size_t>int(min_length)
+
+        self.has_max_len = max_length is not None
+        if self.has_max_len:
+            self.max_len = <size_t>int(max_length)
+
+
+cdef class CompiledSchemaSpec:
+    cdef public object schema_cls
+    cdef public tuple fields
+    cdef public int num_fields
+
+    def __cinit__(self, object schema_cls, list fields):
+        self.schema_cls = schema_cls
+        self.fields = tuple(fields)
+        self.num_fields = len(fields)
+
+
 cdef class CompiledParamSpec:
-    """Pre-compiled C parameter extraction and validation descriptor."""
     cdef public str arg_name
     cdef public bytes lookup_key
     cdef const char *_key_ptr
     cdef size_t _key_len
-    cdef public int source       # SRC_PATH, SRC_QUERY, SRC_HEADER, SRC_COOKIE, SRC_REQUEST
-    cdef public int param_type   # TYPE_INT, TYPE_FLOAT, TYPE_STR, TYPE_REQUEST
+    cdef public int source       # SRC_PATH..SRC_BODY_SCHEMA
+    cdef public int param_type   # TYPE_INT..TYPE_SCHEMA
     cdef public int path_index
     cdef public bint required
     cdef public object default_val
+    cdef public CompiledSchemaSpec schema_spec
 
     cdef public bint has_ge
     cdef public int64_t int_ge
@@ -147,6 +263,7 @@ cdef class CompiledParamSpec:
         object lt=None,
         object min_length=None,
         object max_length=None,
+        CompiledSchemaSpec schema_spec=None,
     ):
         self.arg_name = arg_name
         self.lookup_key = lookup_name.encode("utf-8")
@@ -161,6 +278,7 @@ cdef class CompiledParamSpec:
         self.path_index = path_index
         self.required = required
         self.default_val = default_val
+        self.schema_spec = schema_spec
 
         self.has_ge = ge is not None
         if self.has_ge:
@@ -196,12 +314,22 @@ cdef class RouteEntry:
     cdef public bint is_coroutine
     cdef public tuple param_specs
     cdef public int num_params
+    cdef public CompiledSchemaSpec response_schema_spec
+    cdef public int default_status_code
 
-    def __cinit__(self, object fn, list param_specs):
+    def __cinit__(
+        self,
+        object fn,
+        list param_specs,
+        CompiledSchemaSpec response_schema_spec=None,
+        int default_status_code=200,
+    ):
         self.fn = fn
         self.is_coroutine = inspect.iscoroutinefunction(fn)
         self.param_specs = tuple(param_specs)
         self.num_params = len(param_specs)
+        self.response_schema_spec = response_schema_spec
+        self.default_status_code = default_status_code
 
 
 cdef inline void _write_422_error(
@@ -218,6 +346,8 @@ cdef inline void _write_422_error(
         loc = "header"
     elif source == SRC_COOKIE:
         loc = "cookie"
+    elif source == SRC_BODY_SCHEMA:
+        loc = "body"
 
     cdef int written = snprintf(
         out_body_buf, 1024,
@@ -226,6 +356,226 @@ cdef inline void _write_422_error(
     )
     out_body_len[0] = <size_t>written
     out_status_code[0] = 422
+
+
+cdef list _parse_yyjson_array(yyjson_val *arr_val):
+    cdef size_t n = yyjson_get_len(arr_val)
+    cdef list res = []
+    cdef yyjson_val *elem
+    cdef size_t i
+    if n == 0:
+        return res
+    # In yyjson, flat primitive array elements are contiguous or can be stepped:
+    # For safety with any array element, we convert via yyjson primitive inspection
+    elem = yyjson_arr_get_first(arr_val)
+    for i in range(n):
+        if yyjson_is_str(elem):
+            res.append(PyUnicode_DecodeUTF8(yyjson_get_str(elem), <Py_ssize_t>yyjson_get_len(elem), "strict"))
+        elif yyjson_is_int(elem):
+            res.append(yyjson_get_sint(elem))
+        elif yyjson_is_num(elem):
+            res.append(yyjson_get_num(elem))
+        elif yyjson_is_bool(elem):
+            res.append(bool(yyjson_get_bool(elem)))
+        elif yyjson_is_null(elem):
+            res.append(None)
+        elem += 1
+    return res
+
+
+cdef object _deserialize_schema_from_c_json(
+    CompiledSchemaSpec schema_spec,
+    const char *body_ptr,
+    size_t body_len,
+    char *out_body_buf,
+    size_t *out_body_len,
+    int *out_status_code
+):
+    cdef bt_json_doc_t jdoc
+    if bt_json_parse_obj(body_ptr, body_len, &jdoc) != 0:
+        _write_422_error(SRC_BODY_SCHEMA, "__root__", out_body_buf, out_body_len, out_status_code)
+        return None
+
+    cdef object instance = (<type>(schema_spec.schema_cls)).__new__(<type>(schema_spec.schema_cls))
+    cdef int i
+    cdef CompiledFieldSpec fspec
+    cdef int found = 0
+    cdef bt_val_error_t err
+    cdef int64_t v_int = 0
+    cdef double v_flt = 0.0
+    cdef int v_bool = 0
+    cdef const char *v_str = NULL
+    cdef size_t v_str_len = 0
+    cdef yyjson_val *raw_val = NULL
+    cdef object py_val
+
+    for i in range(schema_spec.num_fields):
+        fspec = <CompiledFieldSpec>(schema_spec.fields[i])
+        found = 0
+
+        if fspec.field_type == TYPE_INT:
+            err = bt_json_get_int64_checked(
+                &jdoc, fspec._key_ptr, fspec._key_len,
+                fspec.has_ge, fspec.int_ge,
+                fspec.has_le, fspec.int_le,
+                fspec.has_gt, fspec.int_gt,
+                fspec.has_lt, fspec.int_lt,
+                &found, &v_int
+            )
+            if err != BT_ERR_NONE:
+                _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return None
+            if found:
+                PyObject_GenericSetAttr(instance, fspec.name, v_int)
+                continue
+
+        elif fspec.field_type == TYPE_FLOAT:
+            err = bt_json_get_double_checked(
+                &jdoc, fspec._key_ptr, fspec._key_len,
+                fspec.has_ge, fspec.float_ge,
+                fspec.has_le, fspec.float_le,
+                fspec.has_gt, fspec.float_gt,
+                fspec.has_lt, fspec.float_lt,
+                &found, &v_flt
+            )
+            if err != BT_ERR_NONE:
+                _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return None
+            if found:
+                PyObject_GenericSetAttr(instance, fspec.name, v_flt)
+                continue
+
+        elif fspec.field_type == TYPE_BOOL:
+            err = bt_json_get_bool_checked(&jdoc, fspec._key_ptr, fspec._key_len, &found, &v_bool)
+            if err != BT_ERR_NONE:
+                _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return None
+            if found:
+                PyObject_GenericSetAttr(instance, fspec.name, True if v_bool else False)
+                continue
+
+        elif fspec.field_type == TYPE_STR:
+            err = bt_json_get_str_checked(
+                &jdoc, fspec._key_ptr, fspec._key_len,
+                fspec.has_min_len, fspec.min_len,
+                fspec.has_max_len, fspec.max_len,
+                &found, &v_str, &v_str_len
+            )
+            if err != BT_ERR_NONE:
+                _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return None
+            if found:
+                py_val = PyUnicode_DecodeUTF8(v_str, <Py_ssize_t>v_str_len, "strict")
+                PyObject_GenericSetAttr(instance, fspec.name, py_val)
+                continue
+
+        elif fspec.field_type == TYPE_LIST:
+            raw_val = bt_json_get_raw_field(&jdoc, fspec._key_ptr, fspec._key_len, &found)
+            if found:
+                if not yyjson_is_arr(raw_val):
+                    _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                    return None
+                PyObject_GenericSetAttr(instance, fspec.name, _parse_yyjson_array(raw_val))
+                continue
+
+        # Field was omitted or null in JSON
+        if fspec.required:
+            _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
+            return None
+        if fspec.is_list_default:
+            PyObject_GenericSetAttr(instance, fspec.name, list(fspec.default_val))
+        else:
+            PyObject_GenericSetAttr(instance, fspec.name, fspec.default_val)
+
+    return instance
+
+
+cdef inline void _write_py_value_to_yyjson(
+    bt_json_writer_t *w,
+    const char *key_ptr,
+    size_t key_len,
+    object val
+):
+    cdef const char *s_ptr = NULL
+    cdef Py_ssize_t s_len = 0
+    cdef yyjson_mut_val *k_node
+    cdef yyjson_mut_val *arr_node
+    cdef object item
+
+    if val is None:
+        bt_json_writer_add_null(w, key_ptr, key_len)
+    elif isinstance(val, bool):
+        bt_json_writer_add_bool(w, key_ptr, key_len, 1 if val else 0)
+    elif isinstance(val, int):
+        bt_json_writer_add_int(w, key_ptr, key_len, <int64_t>val)
+    elif isinstance(val, float):
+        bt_json_writer_add_double(w, key_ptr, key_len, <double>val)
+    elif isinstance(val, str):
+        s_ptr = PyUnicode_AsUTF8AndSize(val, &s_len)
+        bt_json_writer_add_str(w, key_ptr, key_len, s_ptr, <size_t>s_len)
+    elif isinstance(val, list):
+        k_node = yyjson_mut_strn(w.doc, key_ptr, key_len)
+        arr_node = yyjson_mut_arr(w.doc)
+        for item in (<list>val):
+            if isinstance(item, str):
+                s_ptr = PyUnicode_AsUTF8AndSize(item, &s_len)
+                yyjson_mut_arr_append(arr_node, yyjson_mut_strn(w.doc, s_ptr, <size_t>s_len))
+            elif isinstance(item, bool):
+                yyjson_mut_arr_append(arr_node, yyjson_mut_bool(w.doc, 1 if item else 0))
+            elif isinstance(item, int):
+                yyjson_mut_arr_append(arr_node, yyjson_mut_sint(w.doc, <int64_t>item))
+            elif isinstance(item, float):
+                yyjson_mut_arr_append(arr_node, yyjson_mut_real(w.doc, <double>item))
+            elif item is None:
+                yyjson_mut_arr_append(arr_node, yyjson_mut_null(w.doc))
+        yyjson_mut_obj_add(w.root, k_node, arr_node)
+
+
+cdef int _serialize_schema_to_c_buf(
+    object obj,
+    CompiledSchemaSpec schema_spec,
+    char *out_body_buf,
+    size_t *out_body_len
+):
+    cdef bt_json_writer_t writer
+    if bt_json_writer_init(&writer) != 0:
+        return -1
+
+    cdef int i
+    cdef CompiledFieldSpec fspec
+    cdef object val
+    cdef bint is_dict = isinstance(obj, dict)
+
+    for i in range(schema_spec.num_fields):
+        fspec = <CompiledFieldSpec>(schema_spec.fields[i])
+        if is_dict:
+            val = (<dict>obj).get(fspec.name, fspec.default_val)
+        else:
+            val = PyObject_GenericGetAttr(obj, fspec.name)
+        _write_py_value_to_yyjson(&writer, fspec._key_ptr, fspec._key_len, val)
+
+    return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
+
+
+cdef int _serialize_dict_to_c_buf(
+    dict d,
+    char *out_body_buf,
+    size_t *out_body_len
+):
+    cdef bt_json_writer_t writer
+    if bt_json_writer_init(&writer) != 0:
+        return -1
+
+    cdef object k, v
+    cdef const char *k_ptr = NULL
+    cdef Py_ssize_t k_len = 0
+
+    for k, v in d.items():
+        if isinstance(k, str):
+            k_ptr = PyUnicode_AsUTF8AndSize(k, &k_len)
+            _write_py_value_to_yyjson(&writer, k_ptr, <size_t>k_len, v)
+
+    return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
 
 
 cdef int _cython_invoke_handler(
@@ -250,6 +600,7 @@ cdef int _cython_invoke_handler(
     cdef int64_t parsed_int = 0
     cdef double parsed_float = 0.0
     cdef Request req_obj
+    cdef object schema_instance
     cdef dict kwargs
 
     try:
@@ -278,6 +629,16 @@ cdef int _cython_invoke_handler(
                     kwargs[spec.arg_name] = req_obj
                     continue
 
+                if spec.source == SRC_BODY_SCHEMA:
+                    schema_instance = _deserialize_schema_from_c_json(
+                        spec.schema_spec, body, body_len,
+                        out_body_buf, out_body_len, out_status_code
+                    )
+                    if schema_instance is None:
+                        return 0  # 422 response already written into out_body_buf
+                    kwargs[spec.arg_name] = schema_instance
+                    continue
+
                 raw_slice.found = 0
                 raw_slice.ptr = NULL
                 raw_slice.len = 0
@@ -300,7 +661,6 @@ cdef int _cython_invoke_handler(
                         kwargs[spec.arg_name] = spec.default_val
                         continue
 
-                # C-level Type Coercion & Constraint Check
                 if spec.param_type == TYPE_INT:
                     val_err = bt_parse_int64_checked(
                         raw_slice,
@@ -329,7 +689,7 @@ cdef int _cython_invoke_handler(
                         return 0
                     kwargs[spec.arg_name] = parsed_float
 
-                else:  # TYPE_STR
+                else:
                     val_err = bt_validate_str_checked(
                         raw_slice,
                         spec.has_min_len, spec.min_len,
@@ -353,18 +713,33 @@ cdef int _cython_invoke_handler(
             else:
                 result = entry.fn(**kwargs)
 
+        out_status_code[0] = entry.default_status_code
+
+        # 1. Fast path if route defines `response_model=...`
+        if entry.response_schema_spec is not None:
+            return _serialize_schema_to_c_buf(result, entry.response_schema_spec, out_body_buf, out_body_len)
+
+        # 2. Fast path if handler returns a `buckthorn.Schema` instance
+        if hasattr(result, "__bt_schema_spec__"):
+            return _serialize_schema_to_c_buf(
+                result, <CompiledSchemaSpec>(result.__bt_schema_spec__), out_body_buf, out_body_len
+            )
+
+        # 3. Fast path if handler returns a Python `dict`
+        if isinstance(result, dict):
+            return _serialize_dict_to_c_buf(<dict>result, out_body_buf, out_body_len)
+
+        # 4. Raw `bytes` or `str` return (Phases 1 & 2)
         if isinstance(result, bytes):
             PyBytes_AsStringAndSize(result, &raw_bytes_ptr, &raw_bytes_len)
             memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
             out_body_len[0] = <size_t>raw_bytes_len
-            out_status_code[0] = 200
             return 0
         elif isinstance(result, str):
             encoded = (<str>result).encode("utf-8")
             PyBytes_AsStringAndSize(encoded, &raw_bytes_ptr, &raw_bytes_len)
             memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
             out_body_len[0] = <size_t>raw_bytes_len
-            out_status_code[0] = 200
             return 0
         else:
             return -1
@@ -387,10 +762,18 @@ cdef class CoreRouter:
             bt_router_destroy(self._router)
             self._router = NULL
 
-    cpdef void add_route(self, str method, str path, object fn, list param_specs=None):
+    cpdef void add_route(
+        self,
+        str method,
+        str path,
+        object fn,
+        list param_specs=None,
+        CompiledSchemaSpec response_schema_spec=None,
+        int status_code=200,
+    ):
         cdef bytes b_method = method.upper().encode("ascii")
         cdef bytes b_path = path.encode("utf-8")
-        cdef RouteEntry entry = RouteEntry(fn, param_specs or [])
+        cdef RouteEntry entry = RouteEntry(fn, param_specs or [], response_schema_spec, status_code)
         self._handler_refs.append(entry)
 
         bt_router_insert(
@@ -414,6 +797,9 @@ cdef class RawResponse:
         self.status_code = status_code
         self.body = body
         self.wire_bytes = wire_bytes
+
+    cpdef object json(self):
+        return _py_json.loads(self.body)
 
 
 cdef class CythonRawTestClient:

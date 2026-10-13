@@ -1,8 +1,9 @@
 # buckthorn/app.py
 import inspect
-from typing import Callable, get_type_hints
+from typing import Any, Callable, Optional, Type, get_type_hints
 from buckthorn._core import CoreRouter, CompiledParamSpec, Request
 from buckthorn.params import ParamInfo, PathInfo, QueryInfo, _UNDEFINED
+from buckthorn.schema import Schema
 
 _TYPE_MAP = {
     int: 1,      # TYPE_INT
@@ -47,6 +48,20 @@ def _compile_route_params(path: str, endpoint: Callable) -> list[CompiledParamSp
             )
             continue
 
+        # Detect buckthorn.Schema request body parameter
+        if isinstance(annotation, type) and issubclass(annotation, Schema):
+            specs.append(
+                CompiledParamSpec(
+                    arg_name=arg_name,
+                    lookup_name=arg_name,
+                    source=6,      # SRC_BODY_SCHEMA
+                    param_type=7,  # TYPE_SCHEMA
+                    required=True,
+                    schema_spec=annotation.__bt_schema_spec__,
+                )
+            )
+            continue
+
         param_type = _TYPE_MAP.get(annotation, 3)
         default_obj = param.default
 
@@ -85,37 +100,80 @@ def _compile_route_params(path: str, endpoint: Callable) -> list[CompiledParamSp
 
 
 class Buckthorn:
-    def __init__(self, title: str = "Buckthorn", version: str = "0.2.0"):
+    def __init__(self, title: str = "Buckthorn", version: str = "0.3.0"):
         self.title = title
         self.version = version
         self._core = CoreRouter()
 
-    def add_api_route(self, path: str, endpoint: Callable, methods: list[str]) -> None:
+    def add_api_route(
+        self,
+        path: str,
+        endpoint: Callable,
+        methods: list[str],
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+    ) -> None:
         param_specs = _compile_route_params(path, endpoint)
+        resp_spec = (
+            response_model.__bt_schema_spec__
+            if (response_model is not None and issubclass(response_model, Schema))
+            else None
+        )
         for method in methods:
-            self._core.add_route(method.upper(), path, endpoint, param_specs)
+            self._core.add_route(
+                method.upper(),
+                path,
+                endpoint,
+                param_specs,
+                resp_spec,
+                status_code,
+            )
 
-    def get(self, path: str):
+    def get(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+    ):
         def decorator(fn: Callable) -> Callable:
-            self.add_api_route(path, fn, ["GET"])
+            self.add_api_route(path, fn, ["GET"], response_model=response_model, status_code=status_code)
             return fn
         return decorator
 
-    def post(self, path: str):
+    def post(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+    ):
         def decorator(fn: Callable) -> Callable:
-            self.add_api_route(path, fn, ["POST"])
+            self.add_api_route(path, fn, ["POST"], response_model=response_model, status_code=status_code)
             return fn
         return decorator
 
-    def put(self, path: str):
+    def put(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+    ):
         def decorator(fn: Callable) -> Callable:
-            self.add_api_route(path, fn, ["PUT"])
+            self.add_api_route(path, fn, ["PUT"], response_model=response_model, status_code=status_code)
             return fn
         return decorator
 
-    def delete(self, path: str):
+    def delete(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+    ):
         def decorator(fn: Callable) -> Callable:
-            self.add_api_route(path, fn, ["DELETE"])
+            self.add_api_route(path, fn, ["DELETE"], response_model=response_model, status_code=status_code)
             return fn
         return decorator
 

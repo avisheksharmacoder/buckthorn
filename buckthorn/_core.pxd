@@ -9,6 +9,41 @@ cdef extern from "c_vendor/picohttpparser.h" nogil:
         const char *value
         size_t value_len
 
+cdef extern from "c_vendor/yyjson.h" nogil:
+    ctypedef struct yyjson_doc:
+        pass
+    ctypedef struct yyjson_val:
+        pass
+    ctypedef struct yyjson_mut_doc:
+        pass
+    ctypedef struct yyjson_mut_val:
+        pass
+
+    bint yyjson_is_null(yyjson_val *val)
+    bint yyjson_is_bool(yyjson_val *val)
+    bint yyjson_is_int(yyjson_val *val)
+    bint yyjson_is_num(yyjson_val *val)
+    bint yyjson_is_str(yyjson_val *val)
+    bint yyjson_is_arr(yyjson_val *val)
+    bint yyjson_is_obj(yyjson_val *val)
+
+    bint yyjson_get_bool(yyjson_val *val)
+    int64_t yyjson_get_sint(yyjson_val *val)
+    double yyjson_get_num(yyjson_val *val)
+    const char *yyjson_get_str(yyjson_val *val)
+    size_t yyjson_get_len(yyjson_val *val)
+    yyjson_val *yyjson_arr_get_first(yyjson_val *arr)
+
+    yyjson_mut_val *yyjson_mut_arr(yyjson_mut_doc *doc)
+    yyjson_mut_val *yyjson_mut_obj(yyjson_mut_doc *doc)
+    yyjson_mut_val *yyjson_mut_sint(yyjson_mut_doc *doc, int64_t num)
+    yyjson_mut_val *yyjson_mut_real(yyjson_mut_doc *doc, double num)
+    yyjson_mut_val *yyjson_mut_bool(yyjson_mut_doc *doc, bint val)
+    yyjson_mut_val *yyjson_mut_null(yyjson_mut_doc *doc)
+    yyjson_mut_val *yyjson_mut_strn(yyjson_mut_doc *doc, const char *str, size_t len)
+    bint yyjson_mut_arr_append(yyjson_mut_val *arr, yyjson_mut_val *val)
+    bint yyjson_mut_obj_add(yyjson_mut_val *obj, yyjson_mut_val *key, yyjson_mut_val *val)
+
 cdef extern from "c_src/bt_arena.h" nogil:
     ctypedef struct bt_arena_t:
         uint8_t *buf
@@ -65,6 +100,67 @@ cdef extern from "c_src/bt_params.h" nogil:
         int has_min_len, size_t min_len,
         int has_max_len, size_t max_len
     )
+
+cdef extern from "c_src/bt_json.h" nogil:
+    ctypedef struct bt_json_doc_t:
+        yyjson_doc *doc
+        yyjson_val *root
+
+    ctypedef struct bt_json_writer_t:
+        yyjson_mut_doc *doc
+        yyjson_mut_val *root
+
+    int bt_json_parse_obj(const char *buf, size_t len, bt_json_doc_t *out_doc)
+
+    bt_val_error_t bt_json_get_int64_checked(
+        bt_json_doc_t *jdoc,
+        const char *key, size_t key_len,
+        int has_ge, int64_t ge,
+        int has_le, int64_t le,
+        int has_gt, int64_t gt,
+        int has_lt, int64_t lt,
+        int *out_found,
+        int64_t *out_val
+    )
+    bt_val_error_t bt_json_get_double_checked(
+        bt_json_doc_t *jdoc,
+        const char *key, size_t key_len,
+        int has_ge, double ge,
+        int has_le, double le,
+        int has_gt, double gt,
+        int has_lt, double lt,
+        int *out_found,
+        double *out_val
+    )
+    bt_val_error_t bt_json_get_bool_checked(
+        bt_json_doc_t *jdoc,
+        const char *key, size_t key_len,
+        int *out_found,
+        int *out_val
+    )
+    bt_val_error_t bt_json_get_str_checked(
+        bt_json_doc_t *jdoc,
+        const char *key, size_t key_len,
+        int has_min_len, size_t min_len,
+        int has_max_len, size_t max_len,
+        int *out_found,
+        const char **out_str,
+        size_t *out_len
+    )
+    yyjson_val *bt_json_get_raw_field(
+        bt_json_doc_t *jdoc,
+        const char *key, size_t key_len,
+        int *out_found
+    )
+
+    int bt_json_writer_init(bt_json_writer_t *w)
+    void bt_json_writer_add_int(bt_json_writer_t *w, const char *key, size_t key_len, int64_t val)
+    void bt_json_writer_add_double(bt_json_writer_t *w, const char *key, size_t key_len, double val)
+    void bt_json_writer_add_bool(bt_json_writer_t *w, const char *key, size_t key_len, int val)
+    void bt_json_writer_add_str(bt_json_writer_t *w, const char *key, size_t key_len,
+                                const char *val, size_t val_len)
+    void bt_json_writer_add_null(bt_json_writer_t *w, const char *key, size_t key_len)
+    int bt_json_writer_finish(bt_json_writer_t *w, char *out_buf, size_t out_cap, size_t *out_len)
 
 cdef extern from "c_src/bt_http.h" nogil:
     ctypedef int (*bt_handler_invoke_fn)(

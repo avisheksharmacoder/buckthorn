@@ -9,8 +9,10 @@ ext_modules = [
             "buckthorn/_core.pyx",
             "buckthorn/c_src/bt_http.c",
             "buckthorn/c_src/bt_params.c",
+            "buckthorn/c_src/bt_json.c",
             "buckthorn/c_vendor/picohttpparser.c",
             "buckthorn/c_vendor/rax.c",
+            "buckthorn/c_vendor/yyjson.c",
         ],
         include_dirs=[
             "buckthorn",
@@ -32,7 +34,7 @@ ext_modules = [
 
 setup(
     name="buckthorn",
-    version="0.2.0",
+    version="0.3.0",
     packages=find_packages(),
     ext_modules=cythonize(
         ext_modules,
