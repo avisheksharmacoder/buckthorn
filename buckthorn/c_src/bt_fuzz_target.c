@@ -19,6 +19,7 @@ static char g_resp_buf[65536];
 
 static int dummy_c_handler(
     void *handler_obj,
+    void *async_client_ctx,
     const char *method, size_t method_len,
     const char *path, size_t path_len,
     const char *query, size_t query_len,
@@ -29,7 +30,7 @@ static int dummy_c_handler(
     char *out_extra_hdrs, size_t *out_extra_hdrs_len,
     int *out_status_code
 ) {
-    (void)handler_obj; (void)method; (void)method_len;
+    (void)handler_obj; (void)async_client_ctx; (void)method; (void)method_len;
     (void)path; (void)path_len; (void)path_params; (void)num_path_params;
     (void)out_extra_hdrs;
 

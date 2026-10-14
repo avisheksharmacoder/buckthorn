@@ -2,12 +2,19 @@
 cimport cython
 from libc.string cimport memcpy
 from libc.stdio cimport snprintf
-from libc.stdint cimport int64_t, uint32_t
+from libc.stdint cimport int64_t, uint32_t, uintptr_t
 from cpython.bytes cimport PyBytes_AsStringAndSize, PyBytes_FromStringAndSize
 from cpython.bytearray cimport PyByteArray_AsString
 from cpython.unicode cimport PyUnicode_DecodeUTF8, PyUnicode_AsUTF8AndSize
 from cpython.object cimport PyObject_SetAttr, PyObject_GetAttr
 import inspect
+import asyncio
+from asyncio import events
+try:
+    import uvloop
+    _HAS_UVLOOP = True
+except ImportError:
+    _HAS_UVLOOP = False
 import json as _py_json
 from buckthorn.exceptions import HTTPException
 
@@ -30,7 +37,10 @@ from buckthorn._core cimport (
     bt_json_writer_add_bool, bt_json_writer_add_str, bt_json_writer_add_null,
     bt_json_writer_finish,
     bt_router_t, bt_raw_response_t,
+    BT_HANDLER_OK, BT_HANDLER_ERROR, BT_HANDLER_SUSPENDED,
     bt_router_create, bt_router_destroy, bt_router_insert,
+    bt_router_set_async_tick_cb, bt_uv_complete_async_request,
+    bt_handle_http_bytes_ex,
     bt_handle_http_bytes, bt_uv_server_run,
     bt_logger_t, bt_log_entry_t, bt_log_kv_t,
     BT_LOG_LEVEL_DEBUG, BT_LOG_LEVEL_INFO, BT_LOG_LEVEL_WARN, BT_LOG_LEVEL_ERROR,
@@ -107,15 +117,196 @@ cdef inline int _detect_callable_kind(object fn):
     return DEP_SYNC_FUNC
 
 
-cdef inline object _step_coroutine_sync(object coro):
-    cdef object value = None
+cdef object _SHARED_ASYNC_LOOP = None
+cdef int _PENDING_ASYNC_TASKS = 0
+
+cdef inline object _get_or_create_async_loop():
+    global _SHARED_ASYNC_LOOP
+    if _SHARED_ASYNC_LOOP is None or _SHARED_ASYNC_LOOP.is_closed():
+        if _HAS_UVLOOP:
+            _SHARED_ASYNC_LOOP = uvloop.new_event_loop()
+        else:
+            _SHARED_ASYNC_LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(_SHARED_ASYNC_LOOP)
+        if hasattr(asyncio, "eager_task_factory") and hasattr(_SHARED_ASYNC_LOOP, "set_task_factory"):
+            try:
+                _SHARED_ASYNC_LOOP.set_task_factory(asyncio.eager_task_factory)
+            except Exception:
+                pass
+    return _SHARED_ASYNC_LOOP
+
+cdef object _drive_coro(object coro, object initial_fut, object loop):
+    cdef object completion_fut = loop.create_future()
     try:
-        coro.send(None)
+        setattr(initial_fut, "_asyncio_future_blocking", False)
+    except Exception:
+        pass
+
+    def on_fut_done(fut):
+        cdef object prev_loop = events._get_running_loop()
+        if prev_loop is None:
+            events._set_running_loop(loop)
+        cdef object next_fut, exc
+        try:
+            exc = fut.exception()
+            if exc is not None:
+                next_fut = coro.throw(exc)
+            else:
+                next_fut = coro.send(fut.result())
+            try:
+                setattr(next_fut, "_asyncio_future_blocking", False)
+            except Exception:
+                pass
+            next_fut.add_done_callback(on_fut_done)
+        except StopIteration as stop:
+            if not completion_fut.done():
+                completion_fut.set_result(stop.value)
+        except BaseException as e:
+            if not completion_fut.done():
+                completion_fut.set_exception(e)
+        finally:
+            if prev_loop is None:
+                events._set_running_loop(None)
+
+    initial_fut.add_done_callback(on_fut_done)
+    return completion_fut
+
+cdef inline object _step_coroutine_sync(object coro):
+    """
+    Tier-1 Eager Fast Path + Tier-2 Event Loop Fallback for synchronous callers (RawTestClient):
+    1. Steps `coro.send(None)` eagerly with zero Task allocation.
+    2. If StopIteration is raised (no blocking I/O), returns `stop.value` in ~80ns.
+    3. If a Future/awaitable is yielded, drives `_drive_coro` on the shared uvloop/asyncio event loop until completion.
+    """
+    cdef object loop = _get_or_create_async_loop()
+    cdef object prev_loop = events._get_running_loop()
+    if prev_loop is None:
+        events._set_running_loop(loop)
+    cdef object first_yielded
+    try:
+        first_yielded = coro.send(None)
     except StopIteration as stop:
-        value = stop.value
+        coro.close()
+        return stop.value
+    except BaseException:
+        coro.close()
+        raise
+    finally:
+        if prev_loop is None:
+            events._set_running_loop(None)
+
+    # Coroutine yielded an incomplete Future/Awaitable! Escalate to Tier-2 Loop Driver:
+    cdef object completion_fut = _drive_coro(coro, first_yielded, loop)
+    try:
+        return loop.run_until_complete(completion_fut)
     finally:
         coro.close()
-    return value
+
+async def _step_coroutine_async(object coro, object loop):
+    """
+    Asynchronous coroutine driver for execution contexts inside an already-running event loop.
+    Avoids calling loop.run_until_complete() reentrantly when loop.is_running() is True.
+    """
+    cdef object prev_loop = events._get_running_loop()
+    if prev_loop is None:
+        events._set_running_loop(loop)
+    cdef object first_yielded
+    try:
+        first_yielded = coro.send(None)
+    except StopIteration as stop:
+        coro.close()
+        return stop.value
+    except BaseException:
+        coro.close()
+        raise
+    finally:
+        if prev_loop is None:
+            events._set_running_loop(None)
+
+    cdef object completion_fut = _drive_coro(coro, first_yielded, loop)
+    try:
+        return await completion_fut
+    finally:
+        coro.close()
+
+cdef int _cython_async_loop_tick() noexcept with gil:
+    global _PENDING_ASYNC_TASKS, _SHARED_ASYNC_LOOP
+    if _PENDING_ASYNC_TASKS <= 0 or _SHARED_ASYNC_LOOP is None:
+        return 0
+    try:
+        # Run one non-blocking iteration of the Python event loop
+        _SHARED_ASYNC_LOOP.call_soon(_SHARED_ASYNC_LOOP.stop)
+        _SHARED_ASYNC_LOOP.run_forever()
+    except Exception:
+        pass
+    return _PENDING_ASYNC_TASKS
+
+cdef void _schedule_suspended_tcp_coro(
+    object coro,
+    object first_yielded,
+    RouteEntry entry,
+    void *async_client_ctx,
+    list teardown_stack,
+    list bg_tasks_list
+):
+    global _PENDING_ASYNC_TASKS
+    cdef uintptr_t client_addr = <uintptr_t>async_client_ctx
+    cdef object loop = _get_or_create_async_loop()
+    _PENDING_ASYNC_TASKS += 1
+
+    async def _drive_and_flush():
+        global _PENDING_ASYNC_TASKS
+        cdef char body_buf[32768]
+        cdef size_t body_len = 0
+        cdef char extra_hdrs[2048]
+        cdef size_t extra_hdrs_len = 0
+        cdef int status_code = entry.default_status_code
+        cdef char *raw_ptr = NULL
+        cdef Py_ssize_t raw_len = 0
+        cdef BackgroundTasks bg_runner
+        cdef object result = None, enc = None, completion_fut = None
+
+        try:
+            completion_fut = _drive_coro(coro, first_yielded, loop)
+            result = await completion_fut
+
+            if entry.response_schema_spec is not None:
+                _serialize_schema_to_c_buf(result, entry.response_schema_spec, body_buf, &body_len)
+            elif hasattr(result, "__bt_schema_spec__"):
+                _serialize_schema_to_c_buf(
+                    result, <CompiledSchemaSpec>(result.__bt_schema_spec__), body_buf, &body_len
+                )
+            elif isinstance(result, dict):
+                _serialize_dict_to_c_buf(<dict>result, body_buf, &body_len)
+            elif isinstance(result, bytes):
+                PyBytes_AsStringAndSize(result, &raw_ptr, &raw_len)
+                memcpy(body_buf, raw_ptr, <size_t>raw_len)
+                body_len = <size_t>raw_len
+            elif isinstance(result, str):
+                enc = (<str>result).encode("utf-8")
+                PyBytes_AsStringAndSize(enc, &raw_ptr, &raw_len)
+                memcpy(body_buf, raw_ptr, <size_t>raw_len)
+                body_len = <size_t>raw_len
+        except HTTPException as http_exc:
+            status_code = <int>http_exc.status_code
+            _serialize_dict_to_c_buf({"detail": http_exc.detail}, body_buf, &body_len)
+        except Exception:
+            status_code = 500
+            memcpy(body_buf, b"Internal Server Error", 21)
+            body_len = 21
+        finally:
+            coro.close()
+            if teardown_stack is not None and len(teardown_stack) > 0:
+                await _teardown_generators_async(teardown_stack, loop)
+            if bg_tasks_list is not None and len(bg_tasks_list) > 0 and status_code < 400:
+                for bg_runner in bg_tasks_list:
+                    await bg_runner._execute_all_async(loop)
+            _PENDING_ASYNC_TASKS -= 1
+            bt_uv_complete_async_request(
+                <void *>client_addr, body_buf, body_len, extra_hdrs, extra_hdrs_len, status_code
+            )
+
+    loop.create_task(_drive_and_flush())
 
 
 @cython.freelist(4096)
@@ -376,6 +567,21 @@ cdef class BackgroundTasks:
             if is_coro:
                 coro = fn(*args, **kwargs)
                 _step_coroutine_sync(coro)
+            else:
+                fn(*args, **kwargs)
+
+    async def _execute_all_async(self, object loop):
+        cdef tuple task_entry
+        cdef object fn, args, kwargs, coro
+        cdef bint is_coro
+        for task_entry in self._tasks:
+            fn = task_entry[0]
+            args = task_entry[1]
+            kwargs = task_entry[2]
+            is_coro = <bint>(task_entry[3])
+            if is_coro:
+                coro = fn(*args, **kwargs)
+                await _step_coroutine_async(coro, loop)
             else:
                 fn(*args, **kwargs)
 
@@ -1207,7 +1413,7 @@ cdef inline void _teardown_generators(list teardown_stack):
     cdef tuple entry
     cdef int kind
     cdef object gen_obj
-    cdef object anext_coro
+    cdef object aclose_coro
 
     while idx >= 0:
         entry = <tuple>(teardown_stack[idx])
@@ -1222,15 +1428,36 @@ cdef inline void _teardown_generators(list teardown_stack):
                 finally:
                     gen_obj.close()
             elif kind == DEP_ASYNC_GEN:
-                anext_coro = gen_obj.__anext__()
+                aclose_coro = gen_obj.aclose()
+                _step_coroutine_sync(aclose_coro)
+        except Exception:
+            pass
+        idx -= 1
+
+
+async def _teardown_generators_async(list teardown_stack, object loop):
+    """Asynchronously unwinds generator dependencies in LIFO order without reentrant loop.run_until_complete."""
+    cdef Py_ssize_t idx = len(teardown_stack) - 1
+    cdef tuple entry
+    cdef int kind
+    cdef object gen_obj
+    cdef object aclose_coro
+
+    while idx >= 0:
+        entry = <tuple>(teardown_stack[idx])
+        kind = <int>(entry[0])
+        gen_obj = entry[1]
+        try:
+            if kind == DEP_SYNC_GEN:
                 try:
-                    anext_coro.send(None)
-                except (StopAsyncIteration, StopIteration):
+                    next(gen_obj)
+                except StopIteration:
                     pass
                 finally:
-                    anext_coro.close()
-                    aclose_coro = gen_obj.aclose()
-                    _step_coroutine_sync(aclose_coro)
+                    gen_obj.close()
+            elif kind == DEP_ASYNC_GEN:
+                aclose_coro = gen_obj.aclose()
+                await _step_coroutine_async(aclose_coro, loop)
         except Exception:
             pass
         idx -= 1
@@ -1238,6 +1465,7 @@ cdef inline void _teardown_generators(list teardown_stack):
 
 cdef int _execute_route_inner(
     RouteEntry entry,
+    void *async_client_ctx,
     const char *method, size_t method_len,
     const char *path, size_t path_len,
     const char *query, size_t query_len,
@@ -1248,7 +1476,12 @@ cdef int _execute_route_inner(
     char *out_extra_hdrs, size_t *out_extra_hdrs_len,
     int *out_status_code
 ) except -1:
-    cdef object result
+    cdef object result = None
+    cdef object coro_obj = None
+    cdef object first_yielded = None
+    cdef object completion_fut = None
+    cdef object loop = None
+    cdef object prev_loop = None
     cdef char *raw_bytes_ptr = NULL
     cdef Py_ssize_t raw_bytes_len = 0
     cdef int d_idx
@@ -1312,7 +1545,7 @@ cdef int _execute_route_inner(
 
         if entry.num_params == 0:
             if entry.is_coroutine:
-                result = _step_coroutine_sync(entry.fn())
+                coro_obj = entry.fn()
             else:
                 result = entry.fn()
         else:
@@ -1328,9 +1561,41 @@ cdef int _execute_route_inner(
                 return 0
 
             if entry.is_coroutine:
-                result = _step_coroutine_sync(entry.fn(**kwargs))
+                coro_obj = entry.fn(**kwargs)
             else:
                 result = entry.fn(**kwargs)
+
+        if entry.is_coroutine and coro_obj is not None:
+            loop = _get_or_create_async_loop()
+            prev_loop = events._get_running_loop()
+            if prev_loop is None:
+                events._set_running_loop(loop)
+            try:
+                try:
+                    first_yielded = coro_obj.send(None)
+                except StopIteration as stop:
+                    result = stop.value
+                    coro_obj.close()
+                    coro_obj = None
+            finally:
+                if prev_loop is None:
+                    events._set_running_loop(None)
+
+            if coro_obj is not None:
+                if async_client_ctx != NULL:
+                    _schedule_suspended_tcp_coro(
+                        coro_obj, first_yielded, entry, async_client_ctx,
+                        teardown_stack, bg_tasks_list
+                    )
+                    teardown_stack = None
+                    bg_tasks_list = None
+                    return BT_HANDLER_SUSPENDED
+                else:
+                    completion_fut = _drive_coro(coro_obj, first_yielded, loop)
+                    try:
+                        result = loop.run_until_complete(completion_fut)
+                    finally:
+                        coro_obj.close()
 
         out_status_code[0] = entry.default_status_code
 
@@ -1381,7 +1646,7 @@ cdef int _execute_route_inner(
     finally:
         if teardown_stack is not None and len(teardown_stack) > 0:
             _teardown_generators(teardown_stack)
-        if len(bg_tasks_list) > 0 and out_status_code[0] < 400:
+        if bg_tasks_list is not None and len(bg_tasks_list) > 0 and out_status_code[0] < 400:
             for bg_runner in bg_tasks_list:
                 bg_runner._execute_all()
 
@@ -1408,7 +1673,7 @@ cdef class _RouteInvocationContext:
 
     cdef inline MiddlewareResponse execute_sync(self):
         cdef int rc = _execute_route_inner(
-            self.entry, self.method, self.method_len, self.path, self.path_len,
+            self.entry, NULL, self.method, self.method_len, self.path, self.path_len,
             self.query, self.query_len, self.headers, self.num_headers,
             self.path_params, self.num_path_params,
             self.body, self.body_len, self.out_body_buf, self.out_body_len,
@@ -1432,6 +1697,7 @@ cdef object _make_mw_layer(object fn, object nxt):
 
 cdef int _cython_invoke_handler(
     void *handler_obj,
+    void *async_client_ctx,
     const char *method, size_t method_len,
     const char *path, size_t path_len,
     const char *query, size_t query_len,
@@ -1447,7 +1713,7 @@ cdef int _cython_invoke_handler(
 
     if entry.user_middlewares is None or len(entry.user_middlewares) == 0:
         return _execute_route_inner(
-            entry, method, method_len, path, path_len, query, query_len,
+            entry, async_client_ctx, method, method_len, path, path_len, query, query_len,
             headers, num_headers, path_params, num_path_params,
             body, body_len, out_body_buf, out_body_len,
             out_extra_hdrs, out_extra_hdrs_len,
@@ -1629,6 +1895,7 @@ cdef class CoreRouter:
         self._router = bt_router_create(_cython_invoke_handler)
         if self._router == NULL:
             raise MemoryError("Failed to allocate C router")
+        bt_router_set_async_tick_cb(self._router, _cython_async_loop_tick)
 
     def __dealloc__(self):
         if self._router != NULL:

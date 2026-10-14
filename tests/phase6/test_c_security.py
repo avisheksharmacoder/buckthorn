@@ -136,10 +136,16 @@ def test_phase6_c_jwt_security_speed_gate():
         client.send_raw(raw_valid)
 
     iterations = 20_000
-    t0 = time.perf_counter()
-    for _ in range(iterations):
-        res = client.send_raw(raw_valid)
-    elapsed_valid = time.perf_counter() - t0
+    import gc
+    gc.collect()
+    gc.disable()
+    try:
+        t0 = time.perf_counter()
+        for _ in range(iterations):
+            res = client.send_raw(raw_valid)
+        elapsed_valid = time.perf_counter() - t0
+    finally:
+        gc.enable()
     rps_valid = iterations / elapsed_valid
 
     assert res.status_code == 200

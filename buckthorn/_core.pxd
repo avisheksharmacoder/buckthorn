@@ -189,8 +189,16 @@ cdef extern from "c_src/bt_middleware.h" nogil:
     )
 
 cdef extern from "c_src/bt_http.h" nogil:
+    enum:
+        BT_HANDLER_OK
+        BT_HANDLER_ERROR
+        BT_HANDLER_SUSPENDED
+
+    ctypedef int (*bt_async_tick_fn)()
+
     ctypedef int (*bt_handler_invoke_fn)(
         void *handler_obj,
+        void *async_client_ctx,
         const char *method, size_t method_len,
         const char *path, size_t path_len,
         const char *query, size_t query_len,
@@ -216,6 +224,25 @@ cdef extern from "c_src/bt_http.h" nogil:
     void bt_router_destroy(bt_router_t *router)
     int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
                          const char *path, size_t path_len, void *handler_obj)
+    void bt_router_set_async_tick_cb(bt_router_t *router, bt_async_tick_fn tick_cb)
+    void bt_uv_complete_async_request(
+        void *async_client_ctx,
+        const char *body_buf,
+        size_t body_len,
+        const char *extra_hdrs_buf,
+        size_t extra_hdrs_len,
+        int status_code
+    )
+    int bt_handle_http_bytes_ex(
+        bt_router_t *router,
+        void *async_client_ctx,
+        bt_arena_t *arena,
+        const char *raw_req,
+        size_t raw_req_len,
+        char *resp_wire_buf,
+        size_t resp_wire_cap,
+        bt_raw_response_t *out_result
+    )
     int bt_handle_http_bytes(
         bt_router_t *router,
         bt_arena_t *arena,

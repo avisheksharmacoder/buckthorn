@@ -72,6 +72,10 @@ void bt_router_set_max_body_size(bt_router_t *router, size_t max_body_size) {
     if (router) router->max_body_size = max_body_size;
 }
 
+void bt_router_set_async_tick_cb(bt_router_t *router, bt_async_tick_fn tick_cb) {
+    if (router) router->tick_cb = tick_cb;
+}
+
 bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router) {
     return router ? &router->mw : NULL;
 }
@@ -186,8 +190,76 @@ void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger) {
     }
 }
 
-int bt_handle_http_bytes(
+static int bt_format_http_wire_response(
     bt_router_t *router,
+    int status_code,
+    const char *handler_out_buf,
+    size_t handler_out_len,
+    const char *extra_hdrs_buf,
+    size_t extra_hdrs_len,
+    char *resp_wire_buf,
+    size_t resp_wire_cap,
+    bt_raw_response_t *out_result
+) {
+    const char *status_text = bt_status_reason(status_code);
+
+    int hdr_len = snprintf(
+        resp_wire_buf, resp_wire_cap,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: keep-alive\r\n",
+        status_code, status_text, handler_out_len
+    );
+
+    if (hdr_len < 0 || (size_t)hdr_len >= resp_wire_cap) {
+        goto wire_overflow;
+    }
+
+    if (router->mw.cors_enabled && router->mw.cors_append_hdrs_len > 0) {
+        if ((size_t)hdr_len + router->mw.cors_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
+        memcpy(resp_wire_buf + hdr_len, router->mw.cors_append_hdrs, router->mw.cors_append_hdrs_len);
+        hdr_len += (int)router->mw.cors_append_hdrs_len;
+    }
+    if (router->mw.sec_headers_enabled && router->mw.sec_append_hdrs_len > 0) {
+        if ((size_t)hdr_len + router->mw.sec_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
+        memcpy(resp_wire_buf + hdr_len, router->mw.sec_append_hdrs, router->mw.sec_append_hdrs_len);
+        hdr_len += (int)router->mw.sec_append_hdrs_len;
+    }
+    if (extra_hdrs_len > 0 && extra_hdrs_buf) {
+        if ((size_t)hdr_len + extra_hdrs_len >= resp_wire_cap) goto wire_overflow;
+        memcpy(resp_wire_buf + hdr_len, extra_hdrs_buf, extra_hdrs_len);
+        hdr_len += (int)extra_hdrs_len;
+    }
+
+    if ((size_t)hdr_len + 2 + handler_out_len > resp_wire_cap) {
+    wire_overflow: ;
+        size_t len = strlen(RESP_500);
+        memcpy(resp_wire_buf, RESP_500, len);
+        out_result->status_code = 500;
+        out_result->http_wire_buf = resp_wire_buf;
+        out_result->http_wire_len = len;
+        out_result->body_ptr = resp_wire_buf + (len - 21);
+        out_result->body_len = 21;
+        return -1;
+    }
+
+    resp_wire_buf[hdr_len++] = '\r';
+    resp_wire_buf[hdr_len++] = '\n';
+
+    if (handler_out_len > 0 && handler_out_buf) {
+        memcpy(resp_wire_buf + hdr_len, handler_out_buf, handler_out_len);
+    }
+    out_result->status_code = status_code;
+    out_result->http_wire_buf = resp_wire_buf;
+    out_result->http_wire_len = (size_t)hdr_len + handler_out_len;
+    out_result->body_ptr = resp_wire_buf + hdr_len;
+    out_result->body_len = handler_out_len;
+    return 0;
+}
+
+int bt_handle_http_bytes_ex(
+    bt_router_t *router,
+    void *async_client_ctx,
     bt_arena_t *arena,
     const char *raw_req,
     size_t raw_req_len,
@@ -337,6 +409,7 @@ int bt_handle_http_bytes(
 
     int rc = router->invoke_cb(
         handler_obj,
+        async_client_ctx,
         method, method_len,
         path, clean_path_len,
         query, query_len,
@@ -347,6 +420,12 @@ int bt_handle_http_bytes(
         extra_hdrs_buf, &extra_hdrs_len,
         &status_code
     );
+
+    if (rc == BT_HANDLER_SUSPENDED) {
+        /* Coroutine suspended on an awaitable Future; response will be flushed by bt_uv_complete_async_request */
+        bt_arena_reset(arena);
+        return BT_HANDLER_SUSPENDED;
+    }
 
     if (rc != 0) {
         size_t len = strlen(RESP_500);
@@ -360,58 +439,16 @@ int bt_handle_http_bytes(
         return -1;
     }
 
-    const char *status_text = bt_status_reason(status_code);
-
-    int hdr_len = snprintf(
-        resp_wire_buf, resp_wire_cap,
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: keep-alive\r\n",
-        status_code, status_text, handler_out_len
-    );
-
-    if (hdr_len < 0 || (size_t)hdr_len >= resp_wire_cap) {
-        goto wire_overflow;
-    }
-
-    if (router->mw.cors_enabled && router->mw.cors_append_hdrs_len > 0) {
-        if ((size_t)hdr_len + router->mw.cors_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
-        memcpy(resp_wire_buf + hdr_len, router->mw.cors_append_hdrs, router->mw.cors_append_hdrs_len);
-        hdr_len += (int)router->mw.cors_append_hdrs_len;
-    }
-    if (router->mw.sec_headers_enabled && router->mw.sec_append_hdrs_len > 0) {
-        if ((size_t)hdr_len + router->mw.sec_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
-        memcpy(resp_wire_buf + hdr_len, router->mw.sec_append_hdrs, router->mw.sec_append_hdrs_len);
-        hdr_len += (int)router->mw.sec_append_hdrs_len;
-    }
-    if (extra_hdrs_len > 0) {
-        if ((size_t)hdr_len + extra_hdrs_len >= resp_wire_cap) goto wire_overflow;
-        memcpy(resp_wire_buf + hdr_len, extra_hdrs_buf, extra_hdrs_len);
-        hdr_len += (int)extra_hdrs_len;
-    }
-
-    if ((size_t)hdr_len + 2 + handler_out_len > resp_wire_cap) {
-    wire_overflow: ;
-        size_t len = strlen(RESP_500);
-        memcpy(resp_wire_buf, RESP_500, len);
-        out_result->status_code = 500;
-        out_result->http_wire_buf = resp_wire_buf;
-        out_result->http_wire_len = len;
-        out_result->body_ptr = resp_wire_buf + (len - 21);
-        out_result->body_len = 21;
+    if (bt_format_http_wire_response(
+            router, status_code,
+            handler_out_buf, handler_out_len,
+            extra_hdrs_buf, extra_hdrs_len,
+            resp_wire_buf, resp_wire_cap,
+            out_result
+        ) != 0) {
         bt_arena_reset(arena);
         return -1;
     }
-
-    resp_wire_buf[hdr_len++] = '\r';
-    resp_wire_buf[hdr_len++] = '\n';
-
-    memcpy(resp_wire_buf + hdr_len, handler_out_buf, handler_out_len);
-    out_result->status_code = status_code;
-    out_result->http_wire_buf = resp_wire_buf;
-    out_result->http_wire_len = (size_t)hdr_len + handler_out_len;
-    out_result->body_ptr = resp_wire_buf + hdr_len;
-    out_result->body_len = handler_out_len;
 
     if (router->access_logger) {
         bt_logger_log_http_access(
@@ -424,8 +461,22 @@ int bt_handle_http_bytes(
     return 0;
 }
 
+int bt_handle_http_bytes(
+    bt_router_t *router,
+    bt_arena_t *arena,
+    const char *raw_req,
+    size_t raw_req_len,
+    char *resp_wire_buf,
+    size_t resp_wire_cap,
+    bt_raw_response_t *out_result
+) {
+    return bt_handle_http_bytes_ex(
+        router, NULL, arena, raw_req, raw_req_len, resp_wire_buf, resp_wire_cap, out_result
+    );
+}
+
 /* =========================================================================
- * Native libuv TCP Server Glue (Unchanged from Phase 1)
+ * Native libuv TCP Server Glue (Phase 13 Native Async/Await Suspension Support)
  * ========================================================================= */
 typedef struct {
     uv_tcp_t handle;
@@ -434,12 +485,21 @@ typedef struct {
     char read_buf[8192];
     char write_buf[BT_RESP_BUF_SIZE];
     uv_write_t write_req;
+    int in_flight_async_reqs;
+    int is_closing;
 } bt_uv_client_t;
+
+static void on_alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
+static void on_uv_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
 
 static void on_client_close(uv_handle_t *handle) {
     bt_uv_client_t *client = (bt_uv_client_t *)handle->data;
-    bt_arena_destroy(&client->arena);
-    free(client);
+    if (client->in_flight_async_reqs <= 0) {
+        bt_arena_destroy(&client->arena);
+        free(client);
+    } else {
+        client->is_closing = 1;
+    }
 }
 
 static void on_alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
@@ -450,16 +510,63 @@ static void on_alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t
 }
 
 static void on_write_complete(uv_write_t *req, int status) {
-    (void)req;
     (void)status;
+    bt_uv_client_t *client = (bt_uv_client_t *)req->data;
+    if (!client) return;
+    if (client->is_closing) {
+        if (client->in_flight_async_reqs <= 0 && uv_is_closing((const uv_handle_t *)&client->handle)) {
+            bt_arena_destroy(&client->arena);
+            free(client);
+        }
+        return;
+    }
+    if (!uv_is_closing((const uv_handle_t *)&client->handle)) {
+        uv_read_start((uv_stream_t *)&client->handle, on_alloc_buffer, on_uv_read);
+    }
+}
+
+void bt_uv_complete_async_request(
+    void *async_client_ctx,
+    const char *body_buf,
+    size_t body_len,
+    const char *extra_hdrs_buf,
+    size_t extra_hdrs_len,
+    int status_code
+) {
+    if (!async_client_ctx) return;
+    bt_uv_client_t *client = (bt_uv_client_t *)async_client_ctx;
+    client->in_flight_async_reqs--;
+
+    if (client->is_closing || uv_is_closing((const uv_handle_t *)&client->handle)) {
+        if (client->in_flight_async_reqs <= 0) {
+            bt_arena_destroy(&client->arena);
+            free(client);
+        }
+        return;
+    }
+
+    bt_raw_response_t result;
+    bt_format_http_wire_response(
+        client->router,
+        status_code,
+        body_buf, body_len,
+        extra_hdrs_buf, extra_hdrs_len,
+        client->write_buf, sizeof(client->write_buf),
+        &result
+    );
+
+    client->write_req.data = client;
+    uv_buf_t wbuf = uv_buf_init(result.http_wire_buf, (unsigned int)result.http_wire_len);
+    uv_write(&client->write_req, (uv_stream_t *)&client->handle, &wbuf, 1, on_write_complete);
 }
 
 static void on_uv_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     bt_uv_client_t *client = (bt_uv_client_t *)stream->data;
     if (nread > 0) {
         bt_raw_response_t result;
-        bt_handle_http_bytes(
+        int rc = bt_handle_http_bytes_ex(
             client->router,
+            (void *)client,
             &client->arena,
             buf->base,
             (size_t)nread,
@@ -467,10 +574,26 @@ static void on_uv_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) 
             sizeof(client->write_buf),
             &result
         );
-        uv_buf_t wbuf = uv_buf_init(result.http_wire_buf, (unsigned int)result.http_wire_len);
-        uv_write(&client->write_req, stream, &wbuf, 1, on_write_complete);
+        if (rc == BT_HANDLER_SUSPENDED) {
+            client->in_flight_async_reqs++;
+            uv_read_stop(stream);
+        } else {
+            client->write_req.data = client;
+            uv_buf_t wbuf = uv_buf_init(result.http_wire_buf, (unsigned int)result.http_wire_len);
+            uv_write(&client->write_req, stream, &wbuf, 1, on_write_complete);
+        }
     } else if (nread < 0) {
-        uv_close((uv_handle_t *)stream, on_client_close);
+        client->is_closing = 1;
+        if (!uv_is_closing((const uv_handle_t *)stream)) {
+            uv_close((uv_handle_t *)stream, on_client_close);
+        }
+    }
+}
+
+static void on_uv_async_idle_tick(uv_idle_t *handle) {
+    bt_router_t *router = (bt_router_t *)handle->data;
+    if (router && router->tick_cb) {
+        router->tick_cb();
     }
 }
 
@@ -482,6 +605,8 @@ static void on_new_connection(uv_stream_t *server, int status) {
     if (!client) return;
     bt_arena_init(&client->arena, BT_ARENA_DEFAULT_SIZE);
     client->router = router;
+    client->in_flight_async_reqs = 0;
+    client->is_closing = 0;
 
     uv_tcp_init(server->loop, &client->handle);
     client->handle.data = client;
@@ -526,7 +651,19 @@ int bt_uv_server_run(bt_router_t *router, const char *host, int port) {
     uv_signal_init(loop, &sigterm_handle);
     uv_signal_start(&sigterm_handle, on_server_signal, SIGTERM);
 
+    uv_idle_t async_idler;
+    uv_idle_init(loop, &async_idler);
+    async_idler.data = router;
+    if (router->tick_cb) {
+        uv_idle_start(&async_idler, on_uv_async_idle_tick);
+    }
+
     int ret = uv_run(loop, UV_RUN_DEFAULT);
+
+    if (router->tick_cb) {
+        uv_idle_stop(&async_idler);
+        uv_close((uv_handle_t *)&async_idler, NULL);
+    }
 
     uv_signal_stop(&sigint_handle);
     uv_close((uv_handle_t *)&sigint_handle, NULL);

@@ -16,8 +16,17 @@
 #define BT_RESP_BUF_SIZE (64 * 1024)
 #define BT_MAX_PARAM_ROUTES 256
 
+/* Return codes for bt_handler_invoke_fn */
+#define BT_HANDLER_OK 0
+#define BT_HANDLER_ERROR -1
+#define BT_HANDLER_SUSPENDED 2
+
+/* Callback invoked on every libuv tick when 1+ Python async tasks are in flight */
+typedef int (*bt_async_tick_fn)(void);
+
 typedef int (*bt_handler_invoke_fn)(
     void *handler_obj,
+    void *async_client_ctx,
     const char *method, size_t method_len,
     const char *path, size_t path_len,
     const char *query, size_t query_len,
@@ -46,6 +55,7 @@ typedef struct {
 typedef struct {
     rax *tree;
     bt_handler_invoke_fn invoke_cb;
+    bt_async_tick_fn tick_cb;
     size_t num_param_routes;
     bt_param_route_t param_routes[BT_MAX_PARAM_ROUTES];
     bt_logger_t *access_logger;
@@ -64,11 +74,33 @@ typedef struct {
 bt_router_t *bt_router_create(bt_handler_invoke_fn invoke_cb);
 void bt_router_destroy(bt_router_t *router);
 void bt_router_set_max_body_size(bt_router_t *router, size_t max_body_size);
+void bt_router_set_async_tick_cb(bt_router_t *router, bt_async_tick_fn tick_cb);
 
 int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
                      const char *path, size_t path_len, void *handler_obj);
 void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger);
 bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router);
+
+/* Called by Cython when a suspended async route handler resolves on the event loop */
+void bt_uv_complete_async_request(
+    void *async_client_ctx,
+    const char *body_buf,
+    size_t body_len,
+    const char *extra_hdrs_buf,
+    size_t extra_hdrs_len,
+    int status_code
+);
+
+int bt_handle_http_bytes_ex(
+    bt_router_t *router,
+    void *async_client_ctx,
+    bt_arena_t *arena,
+    const char *raw_req,
+    size_t raw_req_len,
+    char *resp_wire_buf,
+    size_t resp_wire_cap,
+    bt_raw_response_t *out_result
+);
 
 int bt_handle_http_bytes(
     bt_router_t *router,
