@@ -27,7 +27,7 @@ from buckthorn.params import (
 )
 from buckthorn.responses import HTMLResponse
 from buckthorn.routing import APIRouter, _join_paths
-from buckthorn.schema import Schema
+from buckthorn.schema import Schema, get_schema_spec
 from buckthorn.security import SecurityBase
 
 _TYPE_MAP = {
@@ -36,6 +36,10 @@ _TYPE_MAP = {
     str: 3,      # TYPE_STR
     Request: 4,  # TYPE_REQUEST
     bool: 5,     # TYPE_BOOL
+    "int": 1,
+    "float": 2,
+    "str": 3,
+    "bool": 5,
 }
 
 
@@ -168,7 +172,8 @@ def _compile_callable_params(
             continue
 
         # 5. Check if parameter is a `buckthorn.Schema` JSON body
-        if isinstance(annotation, type) and issubclass(annotation, Schema):
+        schema_spec = get_schema_spec(annotation)
+        if schema_spec is not None:
             specs.append(
                 CompiledParamSpec(
                     arg_name=arg_name,
@@ -176,7 +181,7 @@ def _compile_callable_params(
                     source=6,      # SRC_BODY_SCHEMA
                     param_type=7,  # TYPE_SCHEMA
                     required=True,
-                    schema_spec=annotation.__bt_schema_spec__,
+                    schema_spec=schema_spec,
                 )
             )
             continue
@@ -367,11 +372,7 @@ class Buckthorn:
             combined_deps.extend(dependencies)
 
         param_specs, dep_steps = _compile_route_plan(path, endpoint, combined_deps)
-        resp_spec = (
-            response_model.__bt_schema_spec__
-            if (response_model is not None and issubclass(response_model, Schema))
-            else None
-        )
+        resp_spec = get_schema_spec(response_model) if response_model is not None else None
         for method in methods:
             m_upper = method.upper()
             self._core.add_route(

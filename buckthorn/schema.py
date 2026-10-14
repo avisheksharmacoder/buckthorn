@@ -1,5 +1,5 @@
 # buckthorn/schema.py
-from typing import Any, Optional, get_origin, get_type_hints
+from typing import Any, Optional, Type, get_origin, get_type_hints
 from buckthorn._core import CompiledFieldSpec, CompiledSchemaSpec
 
 _UNDEFINED = Ellipsis
@@ -11,6 +11,55 @@ _SCHEMA_TYPE_MAP = {
     bool: 5,   # TYPE_BOOL
     list: 6,   # TYPE_LIST
 }
+
+# Global registry mapping both pure-Python Schema classes and compiled Cython cdef classes
+SCHEMA_SPEC_REGISTRY: dict[type, CompiledSchemaSpec] = {}
+
+
+def get_schema_spec(cls_or_obj: Any) -> Optional[CompiledSchemaSpec]:
+    if isinstance(cls_or_obj, type):
+        spec = SCHEMA_SPEC_REGISTRY.get(cls_or_obj)
+        if spec is not None:
+            return spec
+    if isinstance(cls_or_obj, str):
+        for cls, spec in SCHEMA_SPEC_REGISTRY.items():
+            if getattr(cls, "__name__", None) == cls_or_obj:
+                return spec
+    spec = getattr(cls_or_obj, "__bt_schema_spec__", None)
+    if spec is not None:
+        return spec
+    if not isinstance(cls_or_obj, type) and cls_or_obj is not None:
+        return SCHEMA_SPEC_REGISTRY.get(type(cls_or_obj))
+    return None
+
+
+def register_compiled_schema(
+    schema_cls: type,
+    field_defs: list[tuple[str, int, bool, Any, Any, Any, Any, Any, Any, Any]],
+) -> CompiledSchemaSpec:
+    """
+    Registers a Cython `cdef class` struct in the C yyjson validator/serializer table.
+    Each tuple in `field_defs` is:
+      (name, field_type, required, default_val, ge, le, gt, lt, min_length, max_length)
+    """
+    compiled_fields = [
+        CompiledFieldSpec(
+            name=f[0],
+            field_type=f[1],
+            required=f[2],
+            default_val=f[3],
+            ge=f[4],
+            le=f[5],
+            gt=f[6],
+            lt=f[7],
+            min_length=f[8],
+            max_length=f[9],
+        )
+        for f in field_defs
+    ]
+    spec = CompiledSchemaSpec(schema_cls, compiled_fields)
+    SCHEMA_SPEC_REGISTRY[schema_cls] = spec
+    return spec
 
 
 class FieldInfo:
@@ -77,7 +126,9 @@ class Schema:
                 )
             )
 
-        cls.__bt_schema_spec__ = CompiledSchemaSpec(cls, compiled_fields)
+        spec = CompiledSchemaSpec(cls, compiled_fields)
+        cls.__bt_schema_spec__ = spec
+        SCHEMA_SPEC_REGISTRY[cls] = spec
 
     def __init__(self, **kwargs: Any):
         for fspec in self.__bt_schema_spec__.fields:

@@ -6,7 +6,7 @@ from libc.stdint cimport int64_t, uint32_t
 from cpython.bytes cimport PyBytes_AsStringAndSize, PyBytes_FromStringAndSize
 from cpython.bytearray cimport PyByteArray_AsString
 from cpython.unicode cimport PyUnicode_DecodeUTF8, PyUnicode_AsUTF8AndSize
-from cpython.object cimport PyObject_GenericSetAttr, PyObject_GenericGetAttr
+from cpython.object cimport PyObject_SetAttr, PyObject_GetAttr
 import inspect
 import json as _py_json
 from buckthorn.exceptions import HTTPException
@@ -799,7 +799,7 @@ cdef object _deserialize_schema_from_c_json(
                 _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
                 return None
             if found:
-                PyObject_GenericSetAttr(instance, fspec.name, v_int)
+                PyObject_SetAttr(instance, fspec.name, v_int)
                 continue
 
         elif fspec.field_type == TYPE_FLOAT:
@@ -815,7 +815,7 @@ cdef object _deserialize_schema_from_c_json(
                 _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
                 return None
             if found:
-                PyObject_GenericSetAttr(instance, fspec.name, v_flt)
+                PyObject_SetAttr(instance, fspec.name, v_flt)
                 continue
 
         elif fspec.field_type == TYPE_BOOL:
@@ -824,7 +824,7 @@ cdef object _deserialize_schema_from_c_json(
                 _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
                 return None
             if found:
-                PyObject_GenericSetAttr(instance, fspec.name, True if v_bool else False)
+                PyObject_SetAttr(instance, fspec.name, True if v_bool else False)
                 continue
 
         elif fspec.field_type == TYPE_STR:
@@ -839,7 +839,7 @@ cdef object _deserialize_schema_from_c_json(
                 return None
             if found:
                 py_val = PyUnicode_DecodeUTF8(v_str, <Py_ssize_t>v_str_len, "strict")
-                PyObject_GenericSetAttr(instance, fspec.name, py_val)
+                PyObject_SetAttr(instance, fspec.name, py_val)
                 continue
 
         elif fspec.field_type == TYPE_LIST:
@@ -848,16 +848,16 @@ cdef object _deserialize_schema_from_c_json(
                 if not yyjson_is_arr(raw_val):
                     _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
                     return None
-                PyObject_GenericSetAttr(instance, fspec.name, _parse_yyjson_array(raw_val))
+                PyObject_SetAttr(instance, fspec.name, _parse_yyjson_array(raw_val))
                 continue
 
         if fspec.required:
             _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
             return None
         if fspec.is_list_default:
-            PyObject_GenericSetAttr(instance, fspec.name, list(fspec.default_val))
+            PyObject_SetAttr(instance, fspec.name, list(fspec.default_val))
         else:
-            PyObject_GenericSetAttr(instance, fspec.name, fspec.default_val)
+            PyObject_SetAttr(instance, fspec.name, fspec.default_val)
 
     return instance
 
@@ -923,7 +923,7 @@ cdef int _serialize_schema_to_c_buf(
         if is_dict:
             val = (<dict>obj).get(fspec.name, fspec.default_val)
         else:
-            val = PyObject_GenericGetAttr(obj, fspec.name)
+            val = PyObject_GetAttr(obj, fspec.name)
         _write_py_value_to_yyjson(&writer, fspec._key_ptr, fspec._key_len, val)
 
     return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)

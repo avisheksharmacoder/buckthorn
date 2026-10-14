@@ -1,6 +1,7 @@
 # buckthorn/__init__.py
 from buckthorn.app import Buckthorn
 from buckthorn._core import Request, WebSocket, UploadFile, BackgroundTasks
+from buckthorn.compiler import transpile_module_to_pyx, compile_pyx_module
 from buckthorn.exceptions import HTTPException
 from buckthorn.logging import RingLogger
 from buckthorn.params import Path, Query, Header, Cookie, Depends, Security, File
@@ -43,4 +44,6 @@ __all__ = [
     "SecurityHeadersMiddleware",
     "Response",
     "status",
+    "transpile_module_to_pyx",
+    "compile_pyx_module",
 ]

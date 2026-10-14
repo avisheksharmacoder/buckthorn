@@ -1,7 +1,7 @@
 # buckthorn/openapi.py
 from typing import Any, Type
 from buckthorn._core import CompiledFieldSpec, CompiledParamSpec, CompiledSchemaSpec
-from buckthorn.schema import Schema
+from buckthorn.schema import Schema, get_schema_spec
 
 _OPENAPI_TYPE_MAP = {
     1: "integer",  # TYPE_INT
@@ -116,9 +116,9 @@ def build_openapi_schema(
                 }
 
         resp_entry: dict[str, Any] = {"description": "Successful Response"}
-        if response_model is not None and issubclass(response_model, Schema):
-            rm_spec = response_model.__bt_schema_spec__
-            rm_name = response_model.__name__
+        rm_spec = get_schema_spec(response_model) if response_model is not None else None
+        if rm_spec is not None and response_model is not None:
+            rm_name = getattr(response_model, "__name__", "ResponseModel")
             components_schemas[rm_name] = _schema_spec_to_json_schema(rm_spec)
             resp_entry["content"] = {
                 "application/json": {
