@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-29%20passed%20(100%25)-brightgreen.svg)](#testing--verification)
 [![Architecture](https://img.shields.io/badge/technology-C99%20%7C%20Cython%20%7C%20libuv-blueviolet.svg)](#underlying-technologies)
-[![Throughput](https://img.shields.io/badge/throughput->430,000%20RPS-success.svg)](#performance-overview)
+[![Throughput](https://img.shields.io/badge/throughput->30,000%20RPS-success.svg)](#performance-overview)
 
 Buckthorn is an enterprise-grade, high-throughput Python web framework designed for ultra-low latency, mission-critical microservices and real-time APIs. It delivers the declarative syntax, type-hinting, and intuitive developer experience of **FastAPI**, backed by a bare-metal C runtime that matches the raw speed of native C, C++, and Rust HTTP engines.
 

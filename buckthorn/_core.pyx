@@ -46,7 +46,9 @@ from buckthorn._core cimport (
     BT_WS_OP_TEXT, BT_WS_OP_BIN, BT_WS_OP_CLOSE,
     bt_ws_frame_t, bt_multipart_part_t,
     bt_ws_compute_accept, bt_ws_parse_frame, bt_ws_encode_frame,
-    bt_multipart_extract_file
+    bt_multipart_extract_file,
+    bt_router_set_max_body_size,
+    bt_sanitize_header_str
 )
 
 # Parameter Source Constants
@@ -1495,9 +1497,12 @@ cdef int _cython_invoke_handler(
                 out_body_len[0] = <size_t>len(b_out)
 
             if (<MiddlewareResponse>mw_res).headers:
-                hdr_str = "".join(
-                    f"{k}: {v}\r\n" for k, v in (<MiddlewareResponse>mw_res).headers.items()
-                ).encode("utf-8")
+                safe_lines = []
+                for k, v in (<MiddlewareResponse>mw_res).headers.items():
+                    clean_k = str(k).replace("\r", "").replace("\n", "").replace("\0", "")
+                    clean_v = str(v).replace("\r", "").replace("\n", "").replace("\0", "")
+                    safe_lines.append(f"{clean_k}: {clean_v}\r\n")
+                hdr_str = "".join(safe_lines).encode("utf-8")
                 hlen = <size_t>len(hdr_str)
                 if hlen > 2040:
                     hlen = 2040
@@ -1554,7 +1559,8 @@ cdef class CythonRingLogger:
                     break
                 if not isinstance(k, str):
                     continue
-                k_ptr = PyUnicode_AsUTF8AndSize(k, &k_len)
+                clean_k = k.replace('"', '_').replace('\\', '_').replace('\n', '_').replace('\r', '_')
+                k_ptr = PyUnicode_AsUTF8AndSize(clean_k, &k_len)
                 kv = &slot.kvs[kv_idx]
                 copy_klen = <size_t>k_len if k_len < 23 else 23
                 memcpy(kv.key, k_ptr, copy_klen)
@@ -1573,8 +1579,9 @@ cdef class CythonRingLogger:
                     kv.v.f_val = <double>v
                     kv_idx += 1
                 elif isinstance(v, str):
+                    clean_v = v.replace('"', '_').replace('\\', '_').replace('\n', '_').replace('\r', '_')
                     kv.val_type = BT_LOG_VAL_STR
-                    s_ptr = PyUnicode_AsUTF8AndSize(v, &s_len)
+                    s_ptr = PyUnicode_AsUTF8AndSize(clean_v, &s_len)
                     copy_slen = <size_t>s_len if s_len < 47 else 47
                     memcpy(kv.v.s_val, s_ptr, copy_slen)
                     kv.str_len = <uint8_t>copy_slen
@@ -1713,6 +1720,9 @@ cdef class CoreRouter:
             <const char *>b_c, <size_t>len(b_c),
             <const char *>b_h, <size_t>len(b_h)
         )
+
+    cpdef void set_max_body_size(self, size_t max_body_size):
+        bt_router_set_max_body_size(self._router, max_body_size)
 
     cpdef void add_user_middleware(self, object fn):
         self._user_middlewares.append(fn)

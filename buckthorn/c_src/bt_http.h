@@ -10,6 +10,7 @@
 #include "../c_vendor/rax.h"
 #include "bt_logger.h"
 #include "bt_middleware.h"
+#include "bt_audit.h"
 
 #define BT_MAX_HEADERS 64
 #define BT_RESP_BUF_SIZE (64 * 1024)
@@ -49,6 +50,7 @@ typedef struct {
     bt_param_route_t param_routes[BT_MAX_PARAM_ROUTES];
     bt_logger_t *access_logger;
     bt_middleware_chain_t mw;
+    size_t max_body_size;
 } bt_router_t;
 
 typedef struct {
@@ -61,6 +63,7 @@ typedef struct {
 
 bt_router_t *bt_router_create(bt_handler_invoke_fn invoke_cb);
 void bt_router_destroy(bt_router_t *router);
+void bt_router_set_max_body_size(bt_router_t *router, size_t max_body_size);
 
 int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
                      const char *path, size_t path_len, void *handler_obj);

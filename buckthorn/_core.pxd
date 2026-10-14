@@ -228,6 +228,7 @@ cdef extern from "c_src/bt_http.h" nogil:
     int bt_uv_server_run(bt_router_t *router, const char *host, int port)
     void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger)
     bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router)
+    void bt_router_set_max_body_size(bt_router_t *router, size_t max_body_size)
 
 cdef extern from "c_src/bt_logger.h" nogil:
     enum:
@@ -370,4 +371,21 @@ cdef extern from "c_src/bt_realtime.h" nogil:
         size_t target_field_len,
         bt_multipart_part_t *out_part
     )
+
+cdef extern from "c_src/bt_audit.h" nogil:
+    ctypedef enum bt_audit_status_t:
+        BT_AUDIT_OK = 0
+        BT_AUDIT_ERR_BAD_REQUEST = 400
+        BT_AUDIT_ERR_PAYLOAD_TOO_LARGE = 413
+        BT_AUDIT_ERR_URI_TOO_LONG = 414
+
+    bt_audit_status_t bt_audit_http_request(
+        const char *path,
+        size_t path_len,
+        phr_header *headers,
+        size_t num_headers,
+        size_t body_len,
+        size_t max_body_size
+    )
+    size_t bt_sanitize_header_str(const char *in_str, size_t in_len, char *out, size_t out_cap)
 

@@ -293,6 +293,7 @@ class Buckthorn:
         log_file: str = "",
         log_capacity: int = 65536,
         access_log: bool = False,
+        max_body_size: int = 1024 * 1024,
     ):
         self.title = title
         self.version = version
@@ -302,8 +303,10 @@ class Buckthorn:
         self.openapi_url = openapi_url
         self.docs_url = docs_url
         self.scalar_url = scalar_url
+        self.max_body_size = max_body_size
 
         self._core = CoreRouter()
+        self._core.set_max_body_size(max_body_size)
         self.logger = RingLogger(filepath=log_file, capacity=log_capacity)
         if access_log:
             self._core.set_access_logger(self.logger._c_logger)

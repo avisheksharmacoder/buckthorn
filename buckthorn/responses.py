@@ -61,9 +61,11 @@ class FileResponse:
     def _render_c_response(self) -> tuple[bytes, bytes, int]:
         with open(self.path, "rb") as f:
             body_bytes = f.read()
+        safe_media = str(self.media_type).replace("\r", "").replace("\n", "").replace("\0", "")
+        safe_fn = str(self.filename).replace("\r", "").replace("\n", "").replace("\0", "").replace('"', "")
         hdr_str = (
-            f"Content-Type: {self.media_type}\r\n"
-            f'Content-Disposition: attachment; filename="{self.filename}"\r\n'
+            f"Content-Type: {safe_media}\r\n"
+            f'Content-Disposition: attachment; filename="{safe_fn}"\r\n'
         )
         return body_bytes, hdr_str.encode("utf-8"), self.status_code
 

@@ -19,6 +19,18 @@ static const char *RESP_404 =
     "Connection: keep-alive\r\n\r\n"
     "Not Found";
 
+static const char *RESP_413 =
+    "HTTP/1.1 413 Content Too Large\r\n"
+    "Content-Length: 17\r\n"
+    "Connection: close\r\n\r\n"
+    "Content Too Large";
+
+static const char *RESP_414 =
+    "HTTP/1.1 414 URI Too Long\r\n"
+    "Content-Length: 12\r\n"
+    "Connection: close\r\n\r\n"
+    "URI Too Long";
+
 static const char *RESP_500 =
     "HTTP/1.1 500 Internal Server Error\r\n"
     "Content-Length: 21\r\n"
@@ -51,8 +63,13 @@ bt_router_t *bt_router_create(bt_handler_invoke_fn invoke_cb) {
     if (!r) return NULL;
     r->tree = raxNew();
     r->invoke_cb = invoke_cb;
+    r->max_body_size = 1024 * 1024;
     bt_middleware_init(&r->mw);
     return r;
+}
+
+void bt_router_set_max_body_size(bt_router_t *router, size_t max_body_size) {
+    if (router) router->max_body_size = max_body_size;
 }
 
 bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router) {
@@ -209,6 +226,28 @@ int bt_handle_http_bytes(
         return -1;
     }
 
+    const char *body_ptr = raw_req + pret;
+    size_t body_len = raw_req_len - (size_t)pret;
+
+    bt_audit_status_t audit_rc = bt_audit_http_request(
+        path, path_len, headers, num_headers, body_len, router->max_body_size
+    );
+    if (audit_rc != BT_AUDIT_OK) {
+        const char *err_wire = (audit_rc == BT_AUDIT_ERR_PAYLOAD_TOO_LARGE) ? RESP_413 :
+                               (audit_rc == BT_AUDIT_ERR_URI_TOO_LONG) ? RESP_414 : RESP_400;
+        size_t b_len = (audit_rc == BT_AUDIT_ERR_PAYLOAD_TOO_LARGE) ? 17 :
+                       (audit_rc == BT_AUDIT_ERR_URI_TOO_LONG) ? 12 : 11;
+        size_t w_len = strlen(err_wire);
+        memcpy(resp_wire_buf, err_wire, w_len);
+        out_result->status_code = (int)audit_rc;
+        out_result->http_wire_buf = resp_wire_buf;
+        out_result->http_wire_len = w_len;
+        out_result->body_ptr = resp_wire_buf + (w_len - b_len);
+        out_result->body_len = b_len;
+        bt_arena_reset(arena);
+        return -1;
+    }
+
     const char *query = NULL;
     size_t query_len = 0;
     size_t clean_path_len = path_len;
@@ -290,9 +329,6 @@ int bt_handle_http_bytes(
         return 0;
     }
 
-    const char *body_ptr = raw_req + pret;
-    size_t body_len = raw_req_len - (size_t)pret;
-
     char *handler_out_buf = (char *)bt_arena_alloc(arena, 32 * 1024);
     size_t handler_out_len = 0;
     char *extra_hdrs_buf = (char *)bt_arena_alloc(arena, 2048);
@@ -334,17 +370,37 @@ int bt_handle_http_bytes(
         status_code, status_text, handler_out_len
     );
 
+    if (hdr_len < 0 || (size_t)hdr_len >= resp_wire_cap) {
+        goto wire_overflow;
+    }
+
     if (router->mw.cors_enabled && router->mw.cors_append_hdrs_len > 0) {
+        if ((size_t)hdr_len + router->mw.cors_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
         memcpy(resp_wire_buf + hdr_len, router->mw.cors_append_hdrs, router->mw.cors_append_hdrs_len);
         hdr_len += (int)router->mw.cors_append_hdrs_len;
     }
     if (router->mw.sec_headers_enabled && router->mw.sec_append_hdrs_len > 0) {
+        if ((size_t)hdr_len + router->mw.sec_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
         memcpy(resp_wire_buf + hdr_len, router->mw.sec_append_hdrs, router->mw.sec_append_hdrs_len);
         hdr_len += (int)router->mw.sec_append_hdrs_len;
     }
     if (extra_hdrs_len > 0) {
+        if ((size_t)hdr_len + extra_hdrs_len >= resp_wire_cap) goto wire_overflow;
         memcpy(resp_wire_buf + hdr_len, extra_hdrs_buf, extra_hdrs_len);
         hdr_len += (int)extra_hdrs_len;
+    }
+
+    if ((size_t)hdr_len + 2 + handler_out_len > resp_wire_cap) {
+    wire_overflow: ;
+        size_t len = strlen(RESP_500);
+        memcpy(resp_wire_buf, RESP_500, len);
+        out_result->status_code = 500;
+        out_result->http_wire_buf = resp_wire_buf;
+        out_result->http_wire_len = len;
+        out_result->body_ptr = resp_wire_buf + (len - 21);
+        out_result->body_len = 21;
+        bt_arena_reset(arena);
+        return -1;
     }
 
     resp_wire_buf[hdr_len++] = '\r';

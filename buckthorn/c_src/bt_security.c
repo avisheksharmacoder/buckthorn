@@ -116,6 +116,34 @@ bt_sec_result_t bt_jwt_verify_hs256(
     const char *dot2 = (const char *)memchr(dot1 + 1, '.', rem_len);
     if (!dot2) return BT_SEC_ERR_UNAUTHORIZED;
 
+    /* Verify JWT Header specifies "alg": "HS256" */
+    char hdr_json_buf[128];
+    size_t hdr_json_len = 0;
+    if (bt_base64url_decode(
+            tok, (size_t)(dot1 - tok),
+            (uint8_t *)hdr_json_buf, sizeof(hdr_json_buf) - 1, &hdr_json_len
+        ) != 0) {
+        return BT_SEC_ERR_UNAUTHORIZED;
+    }
+    hdr_json_buf[hdr_json_len] = '\0';
+
+    char hdr_pool[512];
+    yyjson_alc hdr_alc;
+    yyjson_alc_pool_init(&hdr_alc, hdr_pool, sizeof(hdr_pool));
+    yyjson_doc *hdr_doc = yyjson_read_opts(hdr_json_buf, hdr_json_len, 0, &hdr_alc, NULL);
+    if (!hdr_doc) {
+        return BT_SEC_ERR_UNAUTHORIZED;
+    }
+    yyjson_val *hdr_root = yyjson_doc_get_root(hdr_doc);
+    if (!hdr_root || !yyjson_is_obj(hdr_root)) {
+        return BT_SEC_ERR_UNAUTHORIZED;
+    }
+    yyjson_val *alg_val = yyjson_obj_getn(hdr_root, "alg", 3);
+    if (!alg_val || !yyjson_is_str(alg_val) ||
+        !bt_const_time_eq(yyjson_get_str(alg_val), yyjson_get_len(alg_val), "HS256", 5)) {
+        return BT_SEC_ERR_UNAUTHORIZED;
+    }
+
     size_t signing_input_len = (size_t)(dot2 - tok);
     const char *payload_b64 = dot1 + 1;
     size_t payload_b64_len = (size_t)(dot2 - payload_b64);
@@ -168,6 +196,19 @@ bt_sec_result_t bt_jwt_verify_hs256(
         int64_t exp_ts = yyjson_get_sint(exp_val);
         int64_t now_ts = (int64_t)time(NULL);
         if (exp_ts <= now_ts) {
+            return BT_SEC_ERR_UNAUTHORIZED;
+        }
+    }
+
+    /* Check `nbf` (Not Before) claim if present */
+    yyjson_val *nbf_val = yyjson_obj_getn(out_jdoc->root, "nbf", 3);
+    if (nbf_val) {
+        if (!yyjson_is_int(nbf_val)) {
+            return BT_SEC_ERR_UNAUTHORIZED;
+        }
+        int64_t nbf_ts = yyjson_get_sint(nbf_val);
+        int64_t now_ts = (int64_t)time(NULL);
+        if (nbf_ts > now_ts) {
             return BT_SEC_ERR_UNAUTHORIZED;
         }
     }

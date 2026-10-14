@@ -14,6 +14,7 @@ ext_modules = [
             "buckthorn/c_src/bt_security.c",
             "buckthorn/c_src/bt_middleware.c",
             "buckthorn/c_src/bt_realtime.c",
+            "buckthorn/c_src/bt_audit.c",
             "buckthorn/c_vendor/picohttpparser.c",
             "buckthorn/c_vendor/rax.c",
             "buckthorn/c_vendor/yyjson.c",
@@ -29,16 +30,25 @@ ext_modules = [
             "-march=native",
             "-msse4.2",
             "-flto",
+            "-fstack-protector-strong",
+            "-D_FORTIFY_SOURCE=3",
+            "-fno-strict-overflow",
+            "-Wformat",
+            "-Wformat-security",
+            "-Werror=format-security",
             "-Wall",
             "-Wno-unused-function",
         ],
-        extra_link_args=["-flto"],
+        extra_link_args=[
+            "-flto",
+            "-Wl,-z,relro,-z,now",
+        ],
     )
 ]
 
 setup(
     name="buckthorn",
-    version="0.7.0",
+    version="1.1.0",
     packages=find_packages(),
     ext_modules=cythonize(
         ext_modules,

@@ -242,6 +242,12 @@ int bt_multipart_extract_file(
                             fn_start, '"', (size_t)(hdr_end - fn_start)
                         );
                         if (fn_end) {
+                            /* Strip any directory path traversal prefixes (/ or \) */
+                            for (const char *p = fn_start; p < fn_end; p++) {
+                                if (*p == '/' || *p == '\\') {
+                                    fn_start = p + 1;
+                                }
+                            }
                             out_part->filename.ptr = fn_start;
                             out_part->filename.len = (size_t)(fn_end - fn_start);
                             out_part->filename.found = 1;

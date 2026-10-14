@@ -27,6 +27,18 @@ static size_t next_power_of_two(size_t n) {
     return p;
 }
 
+static inline void bt_copy_json_safe(char *dst, const char *src, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        char c = src[i];
+        if (c == '"' || c == '\\' || c == '\r' || c == '\n' || (unsigned char)c < 0x20) {
+            dst[i] = '_';
+        } else {
+            dst[i] = c;
+        }
+    }
+    dst[len] = '\0';
+}
+
 static const char *level_to_str(uint8_t level) {
     switch (level) {
         case BT_LOG_LEVEL_DEBUG: return "DEBUG";
@@ -70,10 +82,13 @@ static size_t format_entry_json(const bt_log_entry_t *e, char *line_buf, size_t 
                 (int)kv->key_len, kv->key, kv->v.b_val ? "true" : "false"
             );
         } else if (kv->val_type == BT_LOG_VAL_STR) {
+            char clean_val[64];
+            size_t slen = kv->str_len < (sizeof(clean_val) - 1) ? kv->str_len : (sizeof(clean_val) - 1);
+            bt_copy_json_safe(clean_val, kv->v.s_val, slen);
             added = snprintf(
                 line_buf + pos, cap - (size_t)pos,
                 ",\"%.*s\":\"%.*s\"",
-                (int)kv->key_len, kv->key, (int)kv->str_len, kv->v.s_val
+                (int)kv->key_len, kv->key, (int)slen, clean_val
             );
         }
         if (added > 0 && (size_t)(pos + added) < cap - 3) {
@@ -184,8 +199,7 @@ bt_log_entry_t *bt_logger_acquire_slot(bt_logger_t *logger, uint8_t level,
     slot->num_kvs = 0;
 
     size_t copy_len = msg_len < (sizeof(slot->msg) - 1) ? msg_len : (sizeof(slot->msg) - 1);
-    memcpy(slot->msg, msg, copy_len);
-    slot->msg[copy_len] = '\0';
+    bt_copy_json_safe(slot->msg, msg, copy_len);
     slot->msg_len = (uint8_t)copy_len;
 
     return slot;
