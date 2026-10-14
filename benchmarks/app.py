@@ -18,13 +18,16 @@ This benchmark implements a realistic multi-tenant cloud commerce architecture:
 HOW TO RUN THE SERVER:
 ================================================================================
 Single Worker (Measures pure single-core efficiency):
-    python benchmarks/app.py
+    buckthorn run benchmarks/app:app --host 127.0.0.1 --port 8000
+    # or: python benchmarks/app.py
 
-Multi-Worker (Full CPU core saturation with Linux kernel SO_REUSEPORT):
-    for i in $(seq 1 $(nproc)); do python benchmarks/app.py & done
+Production Compiled Binary (Phase 10 AST-to-Cython Transpiler):
+    buckthorn build benchmarks/app.py --prod --out-dir dist_bench
+    # Run the compiled binary:
+    python -c "import sys; sys.path.insert(0, 'dist_bench'); import app; app.app.run(host='127.0.0.1', port=8000)"
 
-To stop all background workers:
-    pkill -f "benchmarks/app.py"
+Multi-Worker (Linux kernel SO_REUSEPORT across N cores):
+    buckthorn run benchmarks/app:app --host 127.0.0.1 --port 8000 --workers 4
 
 ================================================================================
 WRK BENCHMARK COMMANDS:
@@ -137,6 +140,13 @@ class OrderCreate(Schema):
     shipping_method: str = Field(default="express")
     customer_note: str = Field(default="")
     tags: list[str] = ["retail", "priority"]
+
+
+class ItemCreate(Schema):
+    name: str = Field(min_length=2, max_length=50)
+    price: float = Field(gt=0.0)
+    quantity: int = Field(default=1, ge=1)
+    in_stock: bool = True
 
 
 class OrderPublic(Schema):
@@ -273,6 +283,19 @@ def get_store_analytics(
         "successful_transactions": 642,
         "refund_rate": 0.008,
         "authorized_by": "APIKeyHeader",
+    }
+
+
+@app.post("/items")
+def create_item(payload: ItemCreate):
+    """
+    Endpoint 5: Standalone JSON POST validation benchmark (matches post_item.lua).
+    """
+    return {
+        "name": payload.name,
+        "price": payload.price,
+        "quantity": payload.quantity,
+        "in_stock": payload.in_stock,
     }
 
 

@@ -19,6 +19,8 @@ buckthorn/*.html
 # Distribution / packaging
 build/
 dist/
+dist_*/
+.compiled_bench/
 eggs/
 .eggs/
 *.egg-info/

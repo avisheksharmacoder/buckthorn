@@ -16,13 +16,16 @@ as `benchmarks/app.py`, but with 100% asynchronous routes and async dependencies
 HOW TO RUN THE 100% ASYNC SERVER:
 ================================================================================
 Single Worker:
-    python benchmarks/async_app.py
+    buckthorn run benchmarks/async_app:app --host 127.0.0.1 --port 8000
+    # or: python benchmarks/async_app.py
+
+Production Compiled Binary (Phase 10 AST-to-Cython Transpiler):
+    buckthorn build benchmarks/async_app.py --prod --out-dir dist_bench
+    # Run the compiled binary:
+    python -c "import sys; sys.path.insert(0, 'dist_bench'); import async_app; async_app.app.run(host='127.0.0.1', port=8000)"
 
 Multi-Worker (SO_REUSEPORT across all CPU cores):
-    for i in $(seq 1 $(nproc)); do python benchmarks/async_app.py & done
-
-To stop all background workers:
-    pkill -f "benchmarks/async_app.py"
+    buckthorn run benchmarks/async_app:app --host 127.0.0.1 --port 8000 --workers 4
 
 ================================================================================
 WRK BENCHMARK COMMANDS:
@@ -128,6 +131,13 @@ class OrderCreate(Schema):
     shipping_method: str = Field(default="express")
     customer_note: str = Field(default="")
     tags: list[str] = ["retail", "priority"]
+
+
+class ItemCreate(Schema):
+    name: str = Field(min_length=2, max_length=50)
+    price: float = Field(gt=0.0)
+    quantity: int = Field(default=1, ge=1)
+    in_stock: bool = True
 
 
 class OrderPublic(Schema):
@@ -265,6 +275,19 @@ async def async_get_store_analytics(
         "successful_transactions": 642,
         "refund_rate": 0.008,
         "authorized_by": "APIKeyHeader",
+    }
+
+
+@app.post("/items")
+async def async_create_item(payload: ItemCreate):
+    """
+    Endpoint 5: Standalone JSON POST validation benchmark (matches post_item.lua).
+    """
+    return {
+        "name": payload.name,
+        "price": payload.price,
+        "quantity": payload.quantity,
+        "in_stock": payload.in_stock,
     }
 
 

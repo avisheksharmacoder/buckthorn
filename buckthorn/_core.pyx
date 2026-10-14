@@ -1416,7 +1416,7 @@ cdef class _RouteInvocationContext:
 cdef object _make_mw_layer(object fn, object nxt):
     async def _layer(object r):
         res = fn(r, nxt)
-        if inspect.iscoroutine(res):
+        if inspect.isawaitable(res):
             return await res
         return res
     return _layer

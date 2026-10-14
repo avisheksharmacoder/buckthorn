@@ -396,6 +396,10 @@ class Buckthorn:
                 }
             )
 
+    @property
+    def routes(self) -> list[dict[str, Any]]:
+        return list(self._routes_meta)
+
     def include_router(
         self,
         router: APIRouter,
