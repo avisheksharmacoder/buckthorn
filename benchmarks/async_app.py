@@ -38,8 +38,12 @@ WRK BENCHMARK COMMANDS:
 
 3. Authenticated POST Checkout with JWT:
     wrk -t1 -c100 -d10s --latency -s benchmarks/post_order.lua http://127.0.0.1:8000/stores/101/checkout
+
+4. Non-Blocking Async Suspension (Tier 2 await asyncio.sleep under wrk):
+    wrk -t1 -c100 -d10s --latency http://127.0.0.1:8000/async-io
 """
 
+import asyncio
 import time
 from typing import Optional
 from buckthorn import (
@@ -288,6 +292,20 @@ async def async_create_item(payload: ItemCreate):
         "price": payload.price,
         "quantity": payload.quantity,
         "in_stock": payload.in_stock,
+    }
+
+
+@app.get("/async-io")
+async def async_io_endpoint():
+    """
+    Endpoint 6: Tier-2 non-blocking async suspension benchmark.
+    Suspends on await asyncio.sleep(0.001) to exercise libuv uv_idle_t event loop ticking under wrk.
+    """
+    await asyncio.sleep(0.001)
+    return {
+        "tier": "Tier 2 Non-Blocking Suspension",
+        "waited_ms": 1.0,
+        "status": "resumed",
     }
 
 
