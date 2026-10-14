@@ -133,6 +133,23 @@ static void *bt_match_param_route(
     return raxNotFound;
 }
 
+static inline const char *bt_status_reason(int status_code) {
+    switch (status_code) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 409: return "Conflict";
+        case 422: return "Unprocessable Entity";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        default:  return "OK";
+    }
+}
+
 int bt_handle_http_bytes(
     bt_router_t *router,
     bt_arena_t *arena,
@@ -246,9 +263,7 @@ int bt_handle_http_bytes(
         return -1;
     }
 
-    const char *status_text = (status_code == 200) ? "OK" :
-                              (status_code == 201) ? "Created" :
-                              (status_code == 422) ? "Unprocessable Entity" : "OK";
+    const char *status_text = bt_status_reason(status_code);
 
     int hdr_len = snprintf(
         resp_wire_buf, resp_wire_cap,

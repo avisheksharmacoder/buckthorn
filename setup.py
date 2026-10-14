@@ -34,7 +34,7 @@ ext_modules = [
 
 setup(
     name="buckthorn",
-    version="0.3.0",
+    version="0.4.0",
     packages=find_packages(),
     ext_modules=cythonize(
         ext_modules,

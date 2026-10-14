@@ -1,5 +1,5 @@
 # buckthorn/params.py
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 _UNDEFINED = Ellipsis
 
@@ -50,6 +50,12 @@ class CookieInfo(ParamInfo):
     source_id = 4  # SRC_COOKIE
 
 
+class DependsInfo:
+    def __init__(self, dependency: Optional[Callable[..., Any]] = None, *, use_cache: bool = True):
+        self.dependency = dependency
+        self.use_cache = bool(use_cache)
+
+
 def Path(default: Any = _UNDEFINED, **kwargs: Any) -> Any:
     return PathInfo(default=default, **kwargs)
 
@@ -64,3 +70,7 @@ def Header(default: Any = _UNDEFINED, **kwargs: Any) -> Any:
 
 def Cookie(default: Any = _UNDEFINED, **kwargs: Any) -> Any:
     return CookieInfo(default=default, **kwargs)
+
+
+def Depends(dependency: Optional[Callable[..., Any]] = None, *, use_cache: bool = True) -> Any:
+    return DependsInfo(dependency=dependency, use_cache=use_cache)

@@ -2,7 +2,7 @@
 
 **Hyper-Performance Python Web Framework Powered by C99, Cython, and SIMD Hardware Acceleration.**
 
-[![Tests](https://img.shields.io/badge/tests-13%20passed%20(100%25)-brightgreen.svg)](#-test-suite--verification)
+[![Tests](https://img.shields.io/badge/tests-18%20passed%20(100%25)-brightgreen.svg)](#-test-suite--verification)
 [![Performance](https://img.shields.io/badge/throughput->430,000%20RPS-blueviolet.svg)](#-performance-benchmarks)
 [![Language](https://img.shields.io/badge/language-C99%20%7C%20Cython%20%7C%20Python-blue.svg)](#-why-buckthorn-is-so-fast-the-architecture)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -270,7 +270,7 @@ pytest tests/ -v -s
 ```text
 ============================= test session starts ==============================
 rootdir: /home/avisheks/Documents/python-projects/Python-projects/buckthorn
-collected 13 items
+collected 18 items
 
 tests/phase1/test_core_router.py::test_static_get_and_post_routing PASSED
 tests/phase1/test_core_router.py::test_unmatched_route_returns_404_in_c PASSED
@@ -285,8 +285,13 @@ tests/phase3/test_schema_serde.py::test_single_pass_json_validation_and_response
 tests/phase3/test_schema_serde.py::test_c_yyjson_schema_validation_errors_return_422 PASSED
 tests/phase3/test_schema_serde.py::test_mixed_path_query_and_schema_body_with_dict_response PASSED
 tests/phase3/test_schema_serde.py::test_phase3_yyjson_schema_speed_gate PASSED
+tests/phase4/test_depends_di.py::test_dag_deduplication_and_lifo_generator_teardown PASSED
+tests/phase4/test_depends_di.py::test_use_cache_false_executes_dependency_per_branch PASSED
+tests/phase4/test_depends_di.py::test_http_exception_in_dependency_or_handler_still_runs_generator_teardown PASSED
+tests/phase4/test_depends_di.py::test_class_dependency_shorthand_and_callable_instance PASSED
+tests/phase4/test_depends_di.py::test_phase4_flattened_di_speed_gate PASSED
 
-============================== 13 passed in 0.11s ==============================
+============================== 18 passed in 0.18s ==============================
 ```
 
 ---
@@ -296,8 +301,8 @@ tests/phase3/test_schema_serde.py::test_phase3_yyjson_schema_speed_gate PASSED
 * [x] **Core HTTP Engine**: SIMD `picohttpparser`, Redis `rax` radix router, 64KB bump-pointer C arena.
 * [x] **Zero-Copy Parameter Engine**: Freelisted `Request`, dynamic segment routing, `Path`, `Query`, `Header`, `Cookie` validation.
 * [x] **High-Performance JSON Engine**: `buckthorn.Schema`, single-pass `yyjson` C pool parser, direct-to-buffer response serializer with `response_model` filtering.
+* [x] **Graph Dependency Injection**: Fast topological dependency injection (`Depends`) compiled ahead-of-time with $O(1)$ slot caching, LIFO teardown, and `HTTPException` support.
 * [ ] **C Middleware & Security Engine**: Pure C middleware chain with hardware-accelerated OpenSSL JWT verification.
-* [ ] **Graph Dependency Injection**: Fast topological dependency injection (`Depends`) compiled ahead-of-time.
 * [ ] **Atomic Ring Buffer Logging**: Lock-free C11 atomic ring buffer logger with non-blocking I/O drain worker.
 * [ ] **Full Specification Generator**: Compile-time OpenAPI 3.1 schema generator and Swagger UI integration.
 

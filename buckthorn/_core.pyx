@@ -8,6 +8,7 @@ from cpython.unicode cimport PyUnicode_DecodeUTF8, PyUnicode_AsUTF8AndSize
 from cpython.object cimport PyObject_GenericSetAttr, PyObject_GenericGetAttr
 import inspect
 import json as _py_json
+from buckthorn.exceptions import HTTPException
 
 from buckthorn._core cimport (
     phr_header, bt_arena_t, bt_arena_init, bt_arena_destroy,
@@ -39,6 +40,7 @@ DEF SRC_HEADER      = 3
 DEF SRC_COOKIE      = 4
 DEF SRC_REQUEST     = 5
 DEF SRC_BODY_SCHEMA = 6
+DEF SRC_DEPENDS     = 7
 
 # Parameter / Field Type Constants
 DEF TYPE_INT     = 1
@@ -48,6 +50,43 @@ DEF TYPE_REQUEST = 4
 DEF TYPE_BOOL    = 5
 DEF TYPE_LIST    = 6
 DEF TYPE_SCHEMA  = 7
+DEF TYPE_DEPENDS = 8
+
+# Dependency Callable Execution Kind Constants
+DEF DEP_SYNC_FUNC = 1
+DEF DEP_CORO_FUNC = 2
+DEF DEP_SYNC_GEN  = 3
+DEF DEP_ASYNC_GEN = 4
+
+
+cdef inline int _detect_callable_kind(object fn):
+    if inspect.isasyncgenfunction(fn):
+        return DEP_ASYNC_GEN
+    if inspect.isgeneratorfunction(fn):
+        return DEP_SYNC_GEN
+    if inspect.iscoroutinefunction(fn):
+        return DEP_CORO_FUNC
+    if not isinstance(fn, type) and callable(fn):
+        call_attr = getattr(fn, "__call__", None)
+        if call_attr is not None:
+            if inspect.isasyncgenfunction(call_attr):
+                return DEP_ASYNC_GEN
+            if inspect.isgeneratorfunction(call_attr):
+                return DEP_SYNC_GEN
+            if inspect.iscoroutinefunction(call_attr):
+                return DEP_CORO_FUNC
+    return DEP_SYNC_FUNC
+
+
+cdef inline object _step_coroutine_sync(object coro):
+    cdef object value = None
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        value = stop.value
+    finally:
+        coro.close()
+    return value
 
 
 @cython.freelist(4096)
@@ -118,12 +157,11 @@ cdef class Request:
 
 
 cdef class CompiledFieldSpec:
-    """Pre-compiled C field descriptor for a buckthorn.Schema model."""
     cdef public str name
     cdef public bytes b_name
     cdef const char *_key_ptr
     cdef size_t _key_len
-    cdef public int field_type  # TYPE_INT, TYPE_FLOAT, TYPE_STR, TYPE_BOOL, TYPE_LIST
+    cdef public int field_type
     cdef public bint required
     cdef public object default_val
     cdef public bint is_list_default
@@ -220,9 +258,10 @@ cdef class CompiledParamSpec:
     cdef public bytes lookup_key
     cdef const char *_key_ptr
     cdef size_t _key_len
-    cdef public int source       # SRC_PATH..SRC_BODY_SCHEMA
-    cdef public int param_type   # TYPE_INT..TYPE_SCHEMA
+    cdef public int source       # SRC_PATH..SRC_DEPENDS
+    cdef public int param_type   # TYPE_INT..TYPE_DEPENDS
     cdef public int path_index
+    cdef public int dep_slot_index
     cdef public bint required
     cdef public object default_val
     cdef public CompiledSchemaSpec schema_spec
@@ -264,6 +303,7 @@ cdef class CompiledParamSpec:
         object min_length=None,
         object max_length=None,
         CompiledSchemaSpec schema_spec=None,
+        int dep_slot_index=-1,
     ):
         self.arg_name = arg_name
         self.lookup_key = lookup_name.encode("utf-8")
@@ -276,6 +316,7 @@ cdef class CompiledParamSpec:
         self.source = source
         self.param_type = param_type
         self.path_index = path_index
+        self.dep_slot_index = dep_slot_index
         self.required = required
         self.default_val = default_val
         self.schema_spec = schema_spec
@@ -309,11 +350,29 @@ cdef class CompiledParamSpec:
             self.max_len = <size_t>int(max_length)
 
 
+cdef class CompiledDepStep:
+    """Single node in the compile-time flattened Dependency Injection execution array."""
+    cdef public object fn
+    cdef public int slot_index
+    cdef public int dep_kind      # DEP_SYNC_FUNC, DEP_CORO_FUNC, DEP_SYNC_GEN, DEP_ASYNC_GEN
+    cdef public tuple param_specs
+    cdef public int num_params
+
+    def __cinit__(self, object fn, int slot_index, list param_specs):
+        self.fn = fn
+        self.slot_index = slot_index
+        self.dep_kind = _detect_callable_kind(fn)
+        self.param_specs = tuple(param_specs)
+        self.num_params = len(param_specs)
+
+
 cdef class RouteEntry:
     cdef public object fn
     cdef public bint is_coroutine
     cdef public tuple param_specs
     cdef public int num_params
+    cdef public tuple dep_steps
+    cdef public int num_dep_steps
     cdef public CompiledSchemaSpec response_schema_spec
     cdef public int default_status_code
 
@@ -323,11 +382,15 @@ cdef class RouteEntry:
         list param_specs,
         CompiledSchemaSpec response_schema_spec=None,
         int default_status_code=200,
+        list dep_steps=None,
     ):
         self.fn = fn
         self.is_coroutine = inspect.iscoroutinefunction(fn)
         self.param_specs = tuple(param_specs)
         self.num_params = len(param_specs)
+        cdef list steps = dep_steps or []
+        self.dep_steps = tuple(steps)
+        self.num_dep_steps = len(steps)
         self.response_schema_spec = response_schema_spec
         self.default_status_code = default_status_code
 
@@ -365,8 +428,6 @@ cdef list _parse_yyjson_array(yyjson_val *arr_val):
     cdef size_t i
     if n == 0:
         return res
-    # In yyjson, flat primitive array elements are contiguous or can be stepped:
-    # For safety with any array element, we convert via yyjson primitive inspection
     elem = yyjson_arr_get_first(arr_val)
     for i in range(n):
         if yyjson_is_str(elem):
@@ -478,7 +539,6 @@ cdef object _deserialize_schema_from_c_json(
                 PyObject_GenericSetAttr(instance, fspec.name, _parse_yyjson_array(raw_val))
                 continue
 
-        # Field was omitted or null in JSON
         if fspec.required:
             _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
             return None
@@ -578,6 +638,158 @@ cdef int _serialize_dict_to_c_buf(
     return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
 
 
+cdef int _resolve_kwargs_for_specs(
+    tuple param_specs,
+    int num_params,
+    list dep_slots,
+    const char *method, size_t method_len,
+    const char *path, size_t path_len,
+    const char *query, size_t query_len,
+    phr_header *headers, size_t num_headers,
+    bt_slice_t *path_params, size_t num_path_params,
+    const char *body, size_t body_len,
+    dict out_kwargs,
+    char *out_body_buf,
+    size_t *out_body_len,
+    int *out_status_code
+):
+    """Returns 0 on success, or 1 if a 422 validation error was written to out_body_buf."""
+    cdef int i
+    cdef CompiledParamSpec spec
+    cdef bt_slice_t raw_slice
+    cdef bt_val_error_t val_err
+    cdef int64_t parsed_int = 0
+    cdef double parsed_float = 0.0
+    cdef Request req_obj
+    cdef object schema_instance
+
+    for i in range(num_params):
+        spec = <CompiledParamSpec>(param_specs[i])
+
+        if spec.source == SRC_DEPENDS:
+            out_kwargs[spec.arg_name] = dep_slots[spec.dep_slot_index]
+            continue
+
+        if spec.source == SRC_REQUEST:
+            req_obj = Request.__new__(Request)
+            req_obj.bind_c(
+                method, method_len, path, path_len,
+                query, query_len, headers, num_headers, body, body_len
+            )
+            out_kwargs[spec.arg_name] = req_obj
+            continue
+
+        if spec.source == SRC_BODY_SCHEMA:
+            schema_instance = _deserialize_schema_from_c_json(
+                spec.schema_spec, body, body_len,
+                out_body_buf, out_body_len, out_status_code
+            )
+            if schema_instance is None:
+                return 1
+            out_kwargs[spec.arg_name] = schema_instance
+            continue
+
+        raw_slice.found = 0
+        raw_slice.ptr = NULL
+        raw_slice.len = 0
+
+        if spec.source == SRC_PATH:
+            if spec.path_index >= 0 and <size_t>spec.path_index < num_path_params:
+                raw_slice = path_params[spec.path_index]
+        elif spec.source == SRC_QUERY:
+            bt_find_query_param(query, query_len, spec._key_ptr, spec._key_len, &raw_slice)
+        elif spec.source == SRC_HEADER:
+            bt_find_header(headers, num_headers, spec._key_ptr, spec._key_len, &raw_slice)
+        elif spec.source == SRC_COOKIE:
+            bt_find_cookie(headers, num_headers, spec._key_ptr, spec._key_len, &raw_slice)
+
+        if raw_slice.found == 0:
+            if spec.required:
+                _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return 1
+            else:
+                out_kwargs[spec.arg_name] = spec.default_val
+                continue
+
+        if spec.param_type == TYPE_INT:
+            val_err = bt_parse_int64_checked(
+                raw_slice,
+                spec.has_ge, spec.int_ge,
+                spec.has_le, spec.int_le,
+                spec.has_gt, spec.int_gt,
+                spec.has_lt, spec.int_lt,
+                &parsed_int
+            )
+            if val_err != BT_ERR_NONE:
+                _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return 1
+            out_kwargs[spec.arg_name] = parsed_int
+
+        elif spec.param_type == TYPE_FLOAT:
+            val_err = bt_parse_double_checked(
+                raw_slice,
+                spec.has_ge, spec.float_ge,
+                spec.has_le, spec.float_le,
+                spec.has_gt, spec.float_gt,
+                spec.has_lt, spec.float_lt,
+                &parsed_float
+            )
+            if val_err != BT_ERR_NONE:
+                _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return 1
+            out_kwargs[spec.arg_name] = parsed_float
+
+        else:
+            val_err = bt_validate_str_checked(
+                raw_slice,
+                spec.has_min_len, spec.min_len,
+                spec.has_max_len, spec.max_len
+            )
+            if val_err != BT_ERR_NONE:
+                _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return 1
+            out_kwargs[spec.arg_name] = PyUnicode_DecodeUTF8(
+                raw_slice.ptr, <Py_ssize_t>raw_slice.len, "strict"
+            )
+
+    return 0
+
+
+cdef inline void _teardown_generators(list teardown_stack):
+    """Unwinds active sync and async generator dependencies in LIFO order."""
+    cdef Py_ssize_t idx = len(teardown_stack) - 1
+    cdef tuple entry
+    cdef int kind
+    cdef object gen_obj
+    cdef object anext_coro
+
+    while idx >= 0:
+        entry = <tuple>(teardown_stack[idx])
+        kind = <int>(entry[0])
+        gen_obj = entry[1]
+        try:
+            if kind == DEP_SYNC_GEN:
+                try:
+                    next(gen_obj)
+                except StopIteration:
+                    pass
+                finally:
+                    gen_obj.close()
+            elif kind == DEP_ASYNC_GEN:
+                anext_coro = gen_obj.__anext__()
+                try:
+                    anext_coro.send(None)
+                except (StopAsyncIteration, StopIteration):
+                    pass
+                finally:
+                    anext_coro.close()
+                    aclose_coro = gen_obj.aclose()
+                    _step_coroutine_sync(aclose_coro)
+        except Exception:
+            pass
+        idx -= 1
+
+
 cdef int _cython_invoke_handler(
     void *handler_obj,
     const char *method, size_t method_len,
@@ -593,143 +805,95 @@ cdef int _cython_invoke_handler(
     cdef object result
     cdef char *raw_bytes_ptr = NULL
     cdef Py_ssize_t raw_bytes_len = 0
-    cdef int i
-    cdef CompiledParamSpec spec
-    cdef bt_slice_t raw_slice
-    cdef bt_val_error_t val_err
-    cdef int64_t parsed_int = 0
-    cdef double parsed_float = 0.0
-    cdef Request req_obj
-    cdef object schema_instance
+    cdef int d_idx
+    cdef CompiledDepStep dep_step
+    cdef dict dep_kwargs
     cdef dict kwargs
+    cdef list dep_slots = None
+    cdef list teardown_stack = None
+    cdef object dep_obj
+    cdef object anext_coro
 
     try:
+        if entry.num_dep_steps > 0:
+            dep_slots = [None] * entry.num_dep_steps
+            teardown_stack = []
+
+            for d_idx in range(entry.num_dep_steps):
+                dep_step = <CompiledDepStep>(entry.dep_steps[d_idx])
+                if dep_step.num_params == 0:
+                    if dep_step.dep_kind == DEP_SYNC_FUNC:
+                        dep_slots[dep_step.slot_index] = dep_step.fn()
+                    elif dep_step.dep_kind == DEP_CORO_FUNC:
+                        dep_slots[dep_step.slot_index] = _step_coroutine_sync(dep_step.fn())
+                    elif dep_step.dep_kind == DEP_SYNC_GEN:
+                        dep_obj = dep_step.fn()
+                        teardown_stack.append((DEP_SYNC_GEN, dep_obj))
+                        dep_slots[dep_step.slot_index] = next(dep_obj)
+                    elif dep_step.dep_kind == DEP_ASYNC_GEN:
+                        dep_obj = dep_step.fn()
+                        teardown_stack.append((DEP_ASYNC_GEN, dep_obj))
+                        anext_coro = dep_obj.__anext__()
+                        dep_slots[dep_step.slot_index] = _step_coroutine_sync(anext_coro)
+                else:
+                    dep_kwargs = {}
+                    if _resolve_kwargs_for_specs(
+                        dep_step.param_specs, dep_step.num_params, dep_slots,
+                        method, method_len, path, path_len, query, query_len,
+                        headers, num_headers, path_params, num_path_params,
+                        body, body_len, dep_kwargs,
+                        out_body_buf, out_body_len, out_status_code
+                    ) != 0:
+                        return 0
+
+                    if dep_step.dep_kind == DEP_SYNC_FUNC:
+                        dep_slots[dep_step.slot_index] = dep_step.fn(**dep_kwargs)
+                    elif dep_step.dep_kind == DEP_CORO_FUNC:
+                        dep_slots[dep_step.slot_index] = _step_coroutine_sync(dep_step.fn(**dep_kwargs))
+                    elif dep_step.dep_kind == DEP_SYNC_GEN:
+                        dep_obj = dep_step.fn(**dep_kwargs)
+                        teardown_stack.append((DEP_SYNC_GEN, dep_obj))
+                        dep_slots[dep_step.slot_index] = next(dep_obj)
+                    elif dep_step.dep_kind == DEP_ASYNC_GEN:
+                        dep_obj = dep_step.fn(**dep_kwargs)
+                        teardown_stack.append((DEP_ASYNC_GEN, dep_obj))
+                        anext_coro = dep_obj.__anext__()
+                        dep_slots[dep_step.slot_index] = _step_coroutine_sync(anext_coro)
+
         if entry.num_params == 0:
             if entry.is_coroutine:
-                coro = entry.fn()
-                try:
-                    coro.send(None)
-                except StopIteration as stop:
-                    result = stop.value
-                finally:
-                    coro.close()
+                result = _step_coroutine_sync(entry.fn())
             else:
                 result = entry.fn()
         else:
             kwargs = {}
-            for i in range(entry.num_params):
-                spec = <CompiledParamSpec>(entry.param_specs[i])
-
-                if spec.source == SRC_REQUEST:
-                    req_obj = Request.__new__(Request)
-                    req_obj.bind_c(
-                        method, method_len, path, path_len,
-                        query, query_len, headers, num_headers, body, body_len
-                    )
-                    kwargs[spec.arg_name] = req_obj
-                    continue
-
-                if spec.source == SRC_BODY_SCHEMA:
-                    schema_instance = _deserialize_schema_from_c_json(
-                        spec.schema_spec, body, body_len,
-                        out_body_buf, out_body_len, out_status_code
-                    )
-                    if schema_instance is None:
-                        return 0  # 422 response already written into out_body_buf
-                    kwargs[spec.arg_name] = schema_instance
-                    continue
-
-                raw_slice.found = 0
-                raw_slice.ptr = NULL
-                raw_slice.len = 0
-
-                if spec.source == SRC_PATH:
-                    if spec.path_index >= 0 and <size_t>spec.path_index < num_path_params:
-                        raw_slice = path_params[spec.path_index]
-                elif spec.source == SRC_QUERY:
-                    bt_find_query_param(query, query_len, spec._key_ptr, spec._key_len, &raw_slice)
-                elif spec.source == SRC_HEADER:
-                    bt_find_header(headers, num_headers, spec._key_ptr, spec._key_len, &raw_slice)
-                elif spec.source == SRC_COOKIE:
-                    bt_find_cookie(headers, num_headers, spec._key_ptr, spec._key_len, &raw_slice)
-
-                if raw_slice.found == 0:
-                    if spec.required:
-                        _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
-                        return 0
-                    else:
-                        kwargs[spec.arg_name] = spec.default_val
-                        continue
-
-                if spec.param_type == TYPE_INT:
-                    val_err = bt_parse_int64_checked(
-                        raw_slice,
-                        spec.has_ge, spec.int_ge,
-                        spec.has_le, spec.int_le,
-                        spec.has_gt, spec.int_gt,
-                        spec.has_lt, spec.int_lt,
-                        &parsed_int
-                    )
-                    if val_err != BT_ERR_NONE:
-                        _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
-                        return 0
-                    kwargs[spec.arg_name] = parsed_int
-
-                elif spec.param_type == TYPE_FLOAT:
-                    val_err = bt_parse_double_checked(
-                        raw_slice,
-                        spec.has_ge, spec.float_ge,
-                        spec.has_le, spec.float_le,
-                        spec.has_gt, spec.float_gt,
-                        spec.has_lt, spec.float_lt,
-                        &parsed_float
-                    )
-                    if val_err != BT_ERR_NONE:
-                        _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
-                        return 0
-                    kwargs[spec.arg_name] = parsed_float
-
-                else:
-                    val_err = bt_validate_str_checked(
-                        raw_slice,
-                        spec.has_min_len, spec.min_len,
-                        spec.has_max_len, spec.max_len
-                    )
-                    if val_err != BT_ERR_NONE:
-                        _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
-                        return 0
-                    kwargs[spec.arg_name] = PyUnicode_DecodeUTF8(
-                        raw_slice.ptr, <Py_ssize_t>raw_slice.len, "strict"
-                    )
+            if _resolve_kwargs_for_specs(
+                entry.param_specs, entry.num_params, dep_slots,
+                method, method_len, path, path_len, query, query_len,
+                headers, num_headers, path_params, num_path_params,
+                body, body_len, kwargs,
+                out_body_buf, out_body_len, out_status_code
+            ) != 0:
+                return 0
 
             if entry.is_coroutine:
-                coro = entry.fn(**kwargs)
-                try:
-                    coro.send(None)
-                except StopIteration as stop:
-                    result = stop.value
-                finally:
-                    coro.close()
+                result = _step_coroutine_sync(entry.fn(**kwargs))
             else:
                 result = entry.fn(**kwargs)
 
         out_status_code[0] = entry.default_status_code
 
-        # 1. Fast path if route defines `response_model=...`
         if entry.response_schema_spec is not None:
             return _serialize_schema_to_c_buf(result, entry.response_schema_spec, out_body_buf, out_body_len)
 
-        # 2. Fast path if handler returns a `buckthorn.Schema` instance
         if hasattr(result, "__bt_schema_spec__"):
             return _serialize_schema_to_c_buf(
                 result, <CompiledSchemaSpec>(result.__bt_schema_spec__), out_body_buf, out_body_len
             )
 
-        # 3. Fast path if handler returns a Python `dict`
         if isinstance(result, dict):
             return _serialize_dict_to_c_buf(<dict>result, out_body_buf, out_body_len)
 
-        # 4. Raw `bytes` or `str` return (Phases 1 & 2)
         if isinstance(result, bytes):
             PyBytes_AsStringAndSize(result, &raw_bytes_ptr, &raw_bytes_len)
             memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
@@ -743,8 +907,15 @@ cdef int _cython_invoke_handler(
             return 0
         else:
             return -1
+
+    except HTTPException as http_exc:
+        out_status_code[0] = <int>http_exc.status_code
+        return _serialize_dict_to_c_buf({"detail": http_exc.detail}, out_body_buf, out_body_len)
     except Exception:
         return -1
+    finally:
+        if teardown_stack is not None and len(teardown_stack) > 0:
+            _teardown_generators(teardown_stack)
 
 
 cdef class CoreRouter:
@@ -770,10 +941,13 @@ cdef class CoreRouter:
         list param_specs=None,
         CompiledSchemaSpec response_schema_spec=None,
         int status_code=200,
+        list dep_steps=None,
     ):
         cdef bytes b_method = method.upper().encode("ascii")
         cdef bytes b_path = path.encode("utf-8")
-        cdef RouteEntry entry = RouteEntry(fn, param_specs or [], response_schema_spec, status_code)
+        cdef RouteEntry entry = RouteEntry(
+            fn, param_specs or [], response_schema_spec, status_code, dep_steps or []
+        )
         self._handler_refs.append(entry)
 
         bt_router_insert(
