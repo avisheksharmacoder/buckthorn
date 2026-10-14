@@ -9,6 +9,7 @@
 #include "../c_vendor/picohttpparser.h"
 #include "../c_vendor/rax.h"
 #include "bt_logger.h"
+#include "bt_middleware.h"
 
 #define BT_MAX_HEADERS 64
 #define BT_RESP_BUF_SIZE (64 * 1024)
@@ -23,6 +24,7 @@ typedef int (*bt_handler_invoke_fn)(
     bt_slice_t *path_params, size_t num_path_params,
     const char *body, size_t body_len,
     char *out_body_buf, size_t *out_body_len,
+    char *out_extra_hdrs, size_t *out_extra_hdrs_len,
     int *out_status_code
 );
 
@@ -46,6 +48,7 @@ typedef struct {
     size_t num_param_routes;
     bt_param_route_t param_routes[BT_MAX_PARAM_ROUTES];
     bt_logger_t *access_logger;
+    bt_middleware_chain_t mw;
 } bt_router_t;
 
 typedef struct {
@@ -62,6 +65,7 @@ void bt_router_destroy(bt_router_t *router);
 int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
                      const char *path, size_t path_len, void *handler_obj);
 void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger);
+bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router);
 
 int bt_handle_http_bytes(
     bt_router_t *router,

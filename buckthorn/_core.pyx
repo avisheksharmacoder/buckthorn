@@ -2,7 +2,7 @@
 cimport cython
 from libc.string cimport memcpy
 from libc.stdio cimport snprintf
-from libc.stdint cimport int64_t
+from libc.stdint cimport int64_t, uint32_t
 from cpython.bytes cimport PyBytes_AsStringAndSize, PyBytes_FromStringAndSize
 from cpython.unicode cimport PyUnicode_DecodeUTF8, PyUnicode_AsUTF8AndSize
 from cpython.object cimport PyObject_GenericSetAttr, PyObject_GenericGetAttr
@@ -38,7 +38,10 @@ from buckthorn._core cimport (
     bt_logger_acquire_slot, bt_logger_publish_slot,
     bt_router_set_access_logger,
     bt_sec_result_t, BT_SEC_OK, BT_SEC_ERR_UNAUTHORIZED, BT_SEC_ERR_FORBIDDEN,
-    bt_jwt_verify_hs256, bt_verify_api_key, bt_verify_basic_auth
+    bt_jwt_verify_hs256, bt_verify_api_key, bt_verify_basic_auth,
+    bt_middleware_chain_t, bt_router_get_mw,
+    bt_middleware_configure_cors, bt_middleware_configure_ratelimit,
+    bt_middleware_configure_trusted_host, bt_middleware_configure_sec_headers
 )
 
 # Parameter Source Constants
@@ -466,6 +469,18 @@ cdef class CompiledDepStep:
         self.num_params = len(param_specs)
 
 
+@cython.freelist(1024)
+cdef class MiddlewareResponse:
+    cdef public int status_code
+    cdef public bytes body
+    cdef public dict headers
+
+    def __cinit__(self, int status_code=200, bytes body=b"", dict headers=None):
+        self.status_code = status_code
+        self.body = body
+        self.headers = headers if headers is not None else {}
+
+
 cdef class RouteEntry:
     cdef public object fn
     cdef public bint is_coroutine
@@ -475,6 +490,7 @@ cdef class RouteEntry:
     cdef public int num_dep_steps
     cdef public CompiledSchemaSpec response_schema_spec
     cdef public int default_status_code
+    cdef public list user_middlewares
 
     def __cinit__(
         self,
@@ -483,6 +499,7 @@ cdef class RouteEntry:
         CompiledSchemaSpec response_schema_spec=None,
         int default_status_code=200,
         list dep_steps=None,
+        list user_middlewares=None,
     ):
         self.fn = fn
         self.is_coroutine = inspect.iscoroutinefunction(fn)
@@ -493,6 +510,7 @@ cdef class RouteEntry:
         self.num_dep_steps = len(steps)
         self.response_schema_spec = response_schema_spec
         self.default_status_code = default_status_code
+        self.user_middlewares = user_middlewares
 
 
 cdef inline void _write_422_error(
@@ -984,8 +1002,8 @@ cdef inline void _teardown_generators(list teardown_stack):
         idx -= 1
 
 
-cdef int _cython_invoke_handler(
-    void *handler_obj,
+cdef int _execute_route_inner(
+    RouteEntry entry,
     const char *method, size_t method_len,
     const char *path, size_t path_len,
     const char *query, size_t query_len,
@@ -994,8 +1012,7 @@ cdef int _cython_invoke_handler(
     const char *body, size_t body_len,
     char *out_body_buf, size_t *out_body_len,
     int *out_status_code
-) noexcept with gil:
-    cdef RouteEntry entry = <RouteEntry>handler_obj
+) except -1:
     cdef object result
     cdef char *raw_bytes_ptr = NULL
     cdef Py_ssize_t raw_bytes_len = 0
@@ -1112,6 +1129,133 @@ cdef int _cython_invoke_handler(
             _teardown_generators(teardown_stack)
 
 
+cdef class _RouteInvocationContext:
+    cdef RouteEntry entry
+    cdef const char *method
+    cdef size_t method_len
+    cdef const char *path
+    cdef size_t path_len
+    cdef const char *query
+    cdef size_t query_len
+    cdef phr_header *headers
+    cdef size_t num_headers
+    cdef bt_slice_t *path_params
+    cdef size_t num_path_params
+    cdef const char *body
+    cdef size_t body_len
+    cdef char *out_body_buf
+    cdef size_t *out_body_len
+    cdef int *out_status_code
+
+    cdef inline MiddlewareResponse execute_sync(self):
+        cdef int rc = _execute_route_inner(
+            self.entry, self.method, self.method_len, self.path, self.path_len,
+            self.query, self.query_len, self.headers, self.num_headers,
+            self.path_params, self.num_path_params,
+            self.body, self.body_len, self.out_body_buf, self.out_body_len, self.out_status_code
+        )
+        if rc != 0:
+            return MiddlewareResponse(500, b"Internal Server Error")
+        cdef bytes b_body = PyBytes_FromStringAndSize(self.out_body_buf, <Py_ssize_t>self.out_body_len[0])
+        return MiddlewareResponse(self.out_status_code[0], b_body)
+
+
+cdef object _make_mw_layer(object fn, object nxt):
+    async def _layer(object r):
+        res = fn(r, nxt)
+        if inspect.iscoroutine(res):
+            return await res
+        return res
+    return _layer
+
+
+cdef int _cython_invoke_handler(
+    void *handler_obj,
+    const char *method, size_t method_len,
+    const char *path, size_t path_len,
+    const char *query, size_t query_len,
+    phr_header *headers, size_t num_headers,
+    bt_slice_t *path_params, size_t num_path_params,
+    const char *body, size_t body_len,
+    char *out_body_buf, size_t *out_body_len,
+    char *out_extra_hdrs, size_t *out_extra_hdrs_len,
+    int *out_status_code
+) noexcept with gil:
+    cdef RouteEntry entry = <RouteEntry>handler_obj
+    out_extra_hdrs_len[0] = 0
+
+    if entry.user_middlewares is None or len(entry.user_middlewares) == 0:
+        return _execute_route_inner(
+            entry, method, method_len, path, path_len, query, query_len,
+            headers, num_headers, path_params, num_path_params,
+            body, body_len, out_body_buf, out_body_len, out_status_code
+        )
+
+    # User @app.middleware("http") execution path
+    cdef Request req_obj = Request.__new__(Request)
+    req_obj.bind_c(
+        method, method_len, path, path_len,
+        query, query_len, headers, num_headers, body, body_len
+    )
+
+    cdef _RouteInvocationContext ctx = _RouteInvocationContext.__new__(_RouteInvocationContext)
+    ctx.entry = entry
+    ctx.method = method
+    ctx.method_len = method_len
+    ctx.path = path
+    ctx.path_len = path_len
+    ctx.query = query
+    ctx.query_len = query_len
+    ctx.headers = headers
+    ctx.num_headers = num_headers
+    ctx.path_params = path_params
+    ctx.num_path_params = num_path_params
+    ctx.body = body
+    ctx.body_len = body_len
+    ctx.out_body_buf = out_body_buf
+    ctx.out_body_len = out_body_len
+    ctx.out_status_code = out_status_code
+
+    async def _call_next_terminal(object _req=None):
+        return ctx.execute_sync()
+
+    cdef object next_fn = _call_next_terminal
+    cdef Py_ssize_t idx = len(entry.user_middlewares) - 1
+    while idx >= 0:
+        next_fn = _make_mw_layer(entry.user_middlewares[idx], next_fn)
+        idx -= 1
+
+    cdef object mw_res
+    cdef bytes b_out, hdr_str
+    cdef size_t hlen
+    try:
+        mw_res = _step_coroutine_sync(next_fn(req_obj))
+        if isinstance(mw_res, MiddlewareResponse):
+            out_status_code[0] = (<MiddlewareResponse>mw_res).status_code
+            b_out = (<MiddlewareResponse>mw_res).body
+            if b_out is not None:
+                memcpy(out_body_buf, <const char *>b_out, <size_t>len(b_out))
+                out_body_len[0] = <size_t>len(b_out)
+
+            if (<MiddlewareResponse>mw_res).headers:
+                hdr_str = "".join(
+                    f"{k}: {v}\r\n" for k, v in (<MiddlewareResponse>mw_res).headers.items()
+                ).encode("utf-8")
+                hlen = <size_t>len(hdr_str)
+                if hlen > 2040:
+                    hlen = 2040
+                memcpy(out_extra_hdrs, <const char *>hdr_str, hlen)
+                out_extra_hdrs_len[0] = hlen
+        elif isinstance(mw_res, dict):
+            _serialize_dict_to_c_buf(<dict>mw_res, out_body_buf, out_body_len)
+        elif isinstance(mw_res, bytes):
+            memcpy(out_body_buf, <const char *>mw_res, <size_t>len(mw_res))
+            out_body_len[0] = <size_t>len(mw_res)
+        return 0
+    except Exception:
+        return -1
+
+
 cdef class CythonRingLogger:
     cdef bt_logger_t *_logger
 
@@ -1203,9 +1347,11 @@ cdef class CoreRouter:
     cdef bt_router_t *_router
     cdef list _handler_refs
     cdef CythonRingLogger _access_logger_ref
+    cdef public list _user_middlewares
 
     def __cinit__(self):
         self._handler_refs = []
+        self._user_middlewares = []
         self._router = bt_router_create(_cython_invoke_handler)
         if self._router == NULL:
             raise MemoryError("Failed to allocate C router")
@@ -1228,7 +1374,8 @@ cdef class CoreRouter:
         cdef bytes b_method = method.upper().encode("ascii")
         cdef bytes b_path = path.encode("utf-8")
         cdef RouteEntry entry = RouteEntry(
-            fn, param_specs or [], response_schema_spec, status_code, dep_steps or []
+            fn, param_specs or [], response_schema_spec, status_code, dep_steps or [],
+            self._user_middlewares
         )
         self._handler_refs.append(entry)
 
@@ -1250,6 +1397,42 @@ cdef class CoreRouter:
         else:
             bt_router_set_access_logger(self._router, NULL)
 
+    cpdef void configure_cors(self, str allow_origin, str allow_methods, str allow_headers):
+        cdef bytes b_orig = allow_origin.encode("utf-8")
+        cdef bytes b_meth = allow_methods.encode("utf-8")
+        cdef bytes b_hdrs = allow_headers.encode("utf-8")
+        bt_middleware_configure_cors(
+            bt_router_get_mw(self._router),
+            <const char *>b_orig, <size_t>len(b_orig),
+            <const char *>b_meth, <size_t>len(b_meth),
+            <const char *>b_hdrs, <size_t>len(b_hdrs)
+        )
+
+    cpdef void configure_ratelimit(self, uint32_t max_requests, int64_t window_seconds):
+        bt_middleware_configure_ratelimit(
+            bt_router_get_mw(self._router), max_requests, window_seconds
+        )
+
+    cpdef void configure_trusted_host(self, str allowed_host):
+        cdef bytes b_host = allowed_host.encode("utf-8")
+        bt_middleware_configure_trusted_host(
+            bt_router_get_mw(self._router), <const char *>b_host, <size_t>len(b_host)
+        )
+
+    cpdef void configure_sec_headers(self, str frame_opts, str ctype_opts, str hsts):
+        cdef bytes b_f = frame_opts.encode("utf-8")
+        cdef bytes b_c = ctype_opts.encode("utf-8")
+        cdef bytes b_h = hsts.encode("utf-8")
+        bt_middleware_configure_sec_headers(
+            bt_router_get_mw(self._router),
+            <const char *>b_f, <size_t>len(b_f),
+            <const char *>b_c, <size_t>len(b_c),
+            <const char *>b_h, <size_t>len(b_h)
+        )
+
+    cpdef void add_user_middleware(self, object fn):
+        self._user_middlewares.append(fn)
+
 
 cdef class RawResponse:
     cdef readonly int status_code
@@ -1263,6 +1446,18 @@ cdef class RawResponse:
 
     cpdef object json(self):
         return _py_json.loads(self.body)
+
+    @property
+    def headers(self) -> dict:
+        cdef bytes head_part = self.wire_bytes.split(b"\r\n\r\n", 1)[0]
+        cdef list lines = head_part.split(b"\r\n")[1:]
+        cdef dict result = {}
+        cdef bytes line, k, v
+        for line in lines:
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                result[k.decode("latin1").strip()] = v.decode("latin1").strip()
+        return result
 
 
 cdef class CythonRawTestClient:

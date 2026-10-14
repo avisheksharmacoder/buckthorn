@@ -50,7 +50,12 @@ bt_router_t *bt_router_create(bt_handler_invoke_fn invoke_cb) {
     if (!r) return NULL;
     r->tree = raxNew();
     r->invoke_cb = invoke_cb;
+    bt_middleware_init(&r->mw);
     return r;
+}
+
+bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router) {
+    return router ? &router->mw : NULL;
 }
 
 void bt_router_destroy(bt_router_t *router) {
@@ -213,6 +218,38 @@ int bt_handle_http_bytes(
         query_len = path_len - clean_path_len - 1;
     }
 
+    /* Execute Tier-1 Pure C Pre-Request Middlewares (TrustedHost, CORS OPTIONS, RateLimit) */
+    if (router->mw.trusted_host_enabled || router->mw.cors_enabled || router->mw.ratelimit_enabled) {
+        size_t mw_wire_len = 0;
+        const char *mw_body_ptr = NULL;
+        size_t mw_body_len = 0;
+        int mw_status = 200;
+
+        if (bt_middleware_run_pre(
+                &router->mw,
+                method, method_len,
+                headers, num_headers,
+                resp_wire_buf, resp_wire_cap,
+                &mw_wire_len,
+                &mw_body_ptr, &mw_body_len,
+                &mw_status
+            ) != 0) {
+            out_result->status_code = mw_status;
+            out_result->http_wire_buf = resp_wire_buf;
+            out_result->http_wire_len = mw_wire_len;
+            out_result->body_ptr = mw_body_ptr;
+            out_result->body_len = mw_body_len;
+            if (router->access_logger) {
+                bt_logger_log_http_access(
+                    router->access_logger, method, method_len,
+                    path, clean_path_len, mw_status, bt_monotonic_ns() - t_start_ns
+                );
+            }
+            bt_arena_reset(arena);
+            return 0;
+        }
+    }
+
     size_t key_len = method_len + 1 + clean_path_len;
     unsigned char *lookup_key = (unsigned char *)bt_arena_alloc(arena, key_len);
     if (!lookup_key) return -2;
@@ -257,6 +294,8 @@ int bt_handle_http_bytes(
 
     char *handler_out_buf = (char *)bt_arena_alloc(arena, 32 * 1024);
     size_t handler_out_len = 0;
+    char *extra_hdrs_buf = (char *)bt_arena_alloc(arena, 2048);
+    size_t extra_hdrs_len = 0;
     int status_code = 200;
 
     int rc = router->invoke_cb(
@@ -268,6 +307,7 @@ int bt_handle_http_bytes(
         path_params, num_path_params,
         body_ptr, body_len,
         handler_out_buf, &handler_out_len,
+        extra_hdrs_buf, &extra_hdrs_len,
         &status_code
     );
 
@@ -289,9 +329,25 @@ int bt_handle_http_bytes(
         resp_wire_buf, resp_wire_cap,
         "HTTP/1.1 %d %s\r\n"
         "Content-Length: %zu\r\n"
-        "Connection: keep-alive\r\n\r\n",
+        "Connection: keep-alive\r\n",
         status_code, status_text, handler_out_len
     );
+
+    if (router->mw.cors_enabled && router->mw.cors_append_hdrs_len > 0) {
+        memcpy(resp_wire_buf + hdr_len, router->mw.cors_append_hdrs, router->mw.cors_append_hdrs_len);
+        hdr_len += (int)router->mw.cors_append_hdrs_len;
+    }
+    if (router->mw.sec_headers_enabled && router->mw.sec_append_hdrs_len > 0) {
+        memcpy(resp_wire_buf + hdr_len, router->mw.sec_append_hdrs, router->mw.sec_append_hdrs_len);
+        hdr_len += (int)router->mw.sec_append_hdrs_len;
+    }
+    if (extra_hdrs_len > 0) {
+        memcpy(resp_wire_buf + hdr_len, extra_hdrs_buf, extra_hdrs_len);
+        hdr_len += (int)extra_hdrs_len;
+    }
+
+    resp_wire_buf[hdr_len++] = '\r';
+    resp_wire_buf[hdr_len++] = '\n';
 
     memcpy(resp_wire_buf + hdr_len, handler_out_buf, handler_out_len);
     out_result->status_code = status_code;

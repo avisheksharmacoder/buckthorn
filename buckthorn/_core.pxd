@@ -1,6 +1,6 @@
 # cython: language_level=3
 from libc.stddef cimport size_t
-from libc.stdint cimport uint8_t, int64_t
+from libc.stdint cimport uint8_t, uint32_t, int64_t
 
 cdef extern from "c_vendor/picohttpparser.h" nogil:
     struct phr_header:
@@ -162,6 +162,32 @@ cdef extern from "c_src/bt_json.h" nogil:
     void bt_json_writer_add_null(bt_json_writer_t *w, const char *key, size_t key_len)
     int bt_json_writer_finish(bt_json_writer_t *w, char *out_buf, size_t out_cap, size_t *out_len)
 
+cdef extern from "c_src/bt_middleware.h" nogil:
+    ctypedef struct bt_middleware_chain_t:
+        pass
+
+    void bt_middleware_configure_cors(
+        bt_middleware_chain_t *mw,
+        const char *allow_origin, size_t origin_len,
+        const char *allow_methods, size_t methods_len,
+        const char *allow_headers, size_t headers_len
+    )
+    void bt_middleware_configure_ratelimit(
+        bt_middleware_chain_t *mw,
+        uint32_t max_requests,
+        int64_t window_seconds
+    )
+    void bt_middleware_configure_trusted_host(
+        bt_middleware_chain_t *mw,
+        const char *allowed_host, size_t host_len
+    )
+    void bt_middleware_configure_sec_headers(
+        bt_middleware_chain_t *mw,
+        const char *frame_opts, size_t frame_len,
+        const char *ctype_opts, size_t ctype_len,
+        const char *hsts, size_t hsts_len
+    )
+
 cdef extern from "c_src/bt_http.h" nogil:
     ctypedef int (*bt_handler_invoke_fn)(
         void *handler_obj,
@@ -172,6 +198,7 @@ cdef extern from "c_src/bt_http.h" nogil:
         bt_slice_t *path_params, size_t num_path_params,
         const char *body, size_t body_len,
         char *out_body_buf, size_t *out_body_len,
+        char *out_extra_hdrs, size_t *out_extra_hdrs_len,
         int *out_status_code
     )
 
@@ -200,6 +227,7 @@ cdef extern from "c_src/bt_http.h" nogil:
     )
     int bt_uv_server_run(bt_router_t *router, const char *host, int port)
     void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger)
+    bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router)
 
 cdef extern from "c_src/bt_logger.h" nogil:
     enum:

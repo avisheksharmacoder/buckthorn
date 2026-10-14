@@ -11,8 +11,9 @@ __pycache__/
 *.pyd
 *.a
 
-# Cython generated C files and annotations (preserves c_src/ and c_vendor/)
+# Cython generated C/C++ files and annotations (preserves c_src/ and c_vendor/)
 buckthorn/_core.c
+buckthorn/_core.cpp
 buckthorn/*.html
 
 # Distribution / packaging
@@ -22,15 +23,21 @@ eggs/
 .eggs/
 *.egg-info/
 *.egg
+*.whl
 
-# Virtual environments
+# Virtual environments & secrets
 .venv/
 venv/
 ENV/
 env/
+.env
+.env.*
+!.env.example
 
-# Testing and coverage
+# Testing, type checking, and linting
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
@@ -43,6 +50,7 @@ buckthorn.log
 # IDE & Editor files
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~

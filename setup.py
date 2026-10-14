@@ -12,6 +12,7 @@ ext_modules = [
             "buckthorn/c_src/bt_json.c",
             "buckthorn/c_src/bt_logger.c",
             "buckthorn/c_src/bt_security.c",
+            "buckthorn/c_src/bt_middleware.c",
             "buckthorn/c_vendor/picohttpparser.c",
             "buckthorn/c_vendor/rax.c",
             "buckthorn/c_vendor/yyjson.c",
@@ -36,7 +37,7 @@ ext_modules = [
 
 setup(
     name="buckthorn",
-    version="0.6.0",
+    version="0.7.0",
     packages=find_packages(),
     ext_modules=cythonize(
         ext_modules,

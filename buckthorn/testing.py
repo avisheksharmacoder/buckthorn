@@ -25,13 +25,19 @@ class RawTestClient:
             body = _py_json.dumps(json, separators=(",", ":")).encode("utf-8")
             req_headers.setdefault("Content-Type", "application/json")
 
-        hdr_lines = [f"{method.upper()} {path} HTTP/1.1", "Host: localhost"]
+        has_host = any(k.lower() == "host" for k in req_headers)
+        hdr_lines = [f"{method.upper()} {path} HTTP/1.1"]
+        if not has_host:
+            hdr_lines.append("Host: localhost")
         for k, v in req_headers.items():
             hdr_lines.append(f"{k}: {v}")
         if body:
             hdr_lines.append(f"Content-Length: {len(body)}")
         raw_head = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8")
         return self._client.send_raw(raw_head + body)
+
+    def options(self, path: str, headers: Optional[dict[str, str]] = None) -> RawResponse:
+        return self.request("OPTIONS", path, headers=headers)
 
     def get(self, path: str, headers: Optional[dict[str, str]] = None) -> RawResponse:
         return self.request("GET", path, headers=headers)

@@ -349,5 +349,16 @@ class Buckthorn:
             return fn
         return decorator
 
+    def add_middleware(self, middleware_cls: Any, **options: Any) -> None:
+        mw_instance = middleware_cls(**options) if isinstance(middleware_cls, type) else middleware_cls
+        if hasattr(mw_instance, "install_c"):
+            mw_instance.install_c(self._core)
+
+    def middleware(self, middleware_type: str = "http"):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self._core.add_user_middleware(fn)
+            return fn
+        return decorator
+
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
         self._core.run_server(host, port)
