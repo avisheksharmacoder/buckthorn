@@ -212,29 +212,55 @@ if __name__ == "__main__":
 * **C Compiler**: GCC >= 9 or Clang >= 11 with C99 and SSE4.2 instruction support.
 * **System Libraries**: `libuv` (>= 1.40) and OpenSSL `libcrypto` (>= 1.1.1 or 3.0).
 
-On Debian/Ubuntu:
+**Debian / Ubuntu:**
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential libuv1-dev libssl-dev python3-dev
 ```
 
+**macOS (Homebrew):**
+```bash
+brew install libuv openssl
+# Export OpenSSL paths if not on standard compiler search paths:
+export CFLAGS="-I$(brew --prefix openssl)/include"
+export LDFLAGS="-L$(brew --prefix openssl)/lib"
+```
+
+**Fedora / RHEL:**
+```bash
+sudo dnf install -y gcc libuv-devel openssl-devel python3-devel
+```
+
 #### Installing from Source
+
+All core C dependencies (`picohttpparser`, `rax`, `yyjson`) are **pre-vendored** inside `buckthorn/c_vendor/`, so no external C library download is needed.
+
 ```bash
 # 1. Clone the repository
 git clone https://github.com/avisheksharmacoder/buckthorn.git
 cd buckthorn
 
-# 2. Fetch vendored C dependencies (picohttpparser, rax, yyjson)
-bash scripts/fetch_vendor.sh
+# 2. Create and activate a virtual environment (Python 3.10+)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip setuptools wheel
 
 # 3. Build Cython & C extensions with Link-Time Optimization (-flto)
 pip install -e ".[dev]" --no-build-isolation
 ```
 
+> **Note on `--no-build-isolation`**:  
+> Compiling with `--no-build-isolation` builds directly against the Cython compiler and wheels in your virtual environment for significantly faster compilation. For a standard non-editable install, use `pip install .`.
+
 #### Verifying the Build
-Run the test suite to confirm all C extensions and SIMD instructions are functioning properly:
+Run the test suite to confirm all C extensions, SIMD instructions, and coroutine engines are functioning properly:
 ```bash
-pytest tests/ -v -s
+pytest tests/ -v
+```
+
+Verify that the CLI entry point is active:
+```bash
+buckthorn --help
 ```
 
 ---
