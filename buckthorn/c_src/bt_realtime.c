@@ -79,6 +79,8 @@ int bt_ws_parse_frame(
         pos = 4;
     } else if (payload_len == 127) {
         if (buf_len < 10) return -1;
+        /* RFC 6455 Section 5.2: The most significant bit MUST be 0 */
+        if ((uint8_t)buf[2] & 0x80) return -1;
         payload_len = 0;
         for (int i = 0; i < 8; i++) {
             payload_len = (payload_len << 8) | (size_t)(uint8_t)buf[2 + i];
@@ -93,7 +95,10 @@ int bt_ws_parse_frame(
         pos += 4;
     }
 
-    if (buf_len < pos + payload_len) return -1;
+    /* Subtraction-safe bounds check: immune to `pos + payload_len` 64-bit wrap-around! */
+    if (pos > buf_len || payload_len > (buf_len - pos)) {
+        return -1;
+    }
 
     char *payload_ptr = buf + pos;
     if (out_frame->masked && payload_len > 0) {
@@ -183,6 +188,12 @@ int bt_multipart_extract_file(
     size_t b_len = (size_t)((ctype_hdr.ptr + ctype_hdr.len) - b_val);
     const char *semi = (const char *)memchr(b_val, ';', b_len);
     if (semi) b_len = (size_t)(semi - b_val);
+
+    if (b_len >= 2 && b_val[0] == '"' && b_val[b_len - 1] == '"') {
+        b_val++;
+        b_len -= 2;
+    }
+    if (b_len == 0 || b_len > 70) return 0;
 
     char boundary[128];
     if (b_len + 2 >= sizeof(boundary)) return 0;

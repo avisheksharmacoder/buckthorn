@@ -1062,6 +1062,7 @@ cdef int _resolve_kwargs_for_specs(
     cdef bt_multipart_part_t mp_part
     cdef UploadFile up_file
     cdef BackgroundTasks bg_obj
+    cdef str kwargs_val_str
 
     for i in range(num_params):
         spec = <CompiledParamSpec>(param_specs[i])
@@ -1188,9 +1189,14 @@ cdef int _resolve_kwargs_for_specs(
             if val_err != BT_ERR_NONE:
                 _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
                 return 1
-            out_kwargs[spec.arg_name] = PyUnicode_DecodeUTF8(
-                raw_slice.ptr, <Py_ssize_t>raw_slice.len, "strict"
-            )
+            try:
+                kwargs_val_str = PyUnicode_DecodeUTF8(
+                    raw_slice.ptr, <Py_ssize_t>raw_slice.len, "strict"
+                )
+            except UnicodeDecodeError:
+                _write_422_error(spec.source, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                return 1
+            out_kwargs[spec.arg_name] = kwargs_val_str
 
     return 0
 

@@ -29,7 +29,8 @@ int bt_find_query_param(const char *query, size_t query_len,
                 return 1;
             }
         }
-        cur = pair_end + 1;
+        if (!amp) break;
+        cur = amp + 1;
     }
     return 0;
 }
@@ -81,7 +82,8 @@ int bt_find_cookie(struct phr_header *headers, size_t num_headers,
                 return 1;
             }
         }
-        cur = pair_end + 1;
+        if (!semi) break;
+        cur = semi + 1;
     }
 
     out_val->ptr = NULL;

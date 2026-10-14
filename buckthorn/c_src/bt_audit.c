@@ -78,7 +78,7 @@ bt_audit_status_t bt_audit_http_request(
             if (host_count > 1) return BT_AUDIT_ERR_BAD_REQUEST;
         } else if (nlen == 14 && (c0 == 'C' || c0 == 'c') && strncasecmp(name, "Content-Length", 14) == 0) {
             cl_count++;
-            if (cl_count > 1 || vlen == 0 || vlen > 20) {
+            if (cl_count > 1 || vlen == 0 || vlen > 19) {
                 return BT_AUDIT_ERR_BAD_REQUEST;
             }
             /* Strictly require all digits in Content-Length (no +/- or spaces) */
@@ -87,7 +87,11 @@ bt_audit_status_t bt_audit_http_request(
                 if (val[j] < '0' || val[j] > '9') {
                     return BT_AUDIT_ERR_BAD_REQUEST;
                 }
-                accum = accum * 10 + (size_t)(val[j] - '0');
+                size_t digit = (size_t)(val[j] - '0');
+                if (accum > (SIZE_MAX - digit) / 10) {
+                    return BT_AUDIT_ERR_PAYLOAD_TOO_LARGE;
+                }
+                accum = accum * 10 + digit;
             }
             parsed_cl = accum;
             if (max_body_size > 0 && parsed_cl > max_body_size) {
