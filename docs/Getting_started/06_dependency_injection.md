@@ -24,10 +24,11 @@ When the car leaves the factory, any borrowed tools are put away in exact revers
    - At request time, Buckthorn allocates a single flat list: `dep_slots = [None] * num_dep_steps`.
    - Steps execute sequentially in topological order. Results are stored directly into `dep_slots[step.slot_index]`.
    - Sub-dependencies are passed as direct keyword arguments to dependent functions without runtime inspection.
-3. **Full Generator Lifecycle Support & LIFO Teardown:**
-   - Both **sync generators** (`def get_db(): ... yield db ... finally: db.close()`) and **async generators** (`async def get_session(): ... yield session`) are fully supported.
+3. **Full Generator & Async Lifecycle Support with LIFO Teardown:**
+   - Both **sync generators** (`def get_db(): ... yield db ... finally: db.close()`) and **async generators** (`async def get_session(): ... yield session ... finally: await session.close()`) are natively supported.
+   - **Eager vs. Suspended Async Execution:** Asynchronous dependencies execute via Buckthorn's 3-Tier Eager Coroutine Engine (see [Chapter 19](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/docs/Getting_started/19_native_async_await_and_suspension.md)). If an async dependency resolves without awaiting I/O, it completes eagerly on the active C stack with zero `asyncio.Task` overhead. If it awaits database or network I/O, it suspends cleanly, returning control to `libuv`.
    - When a generator dependency yields its value, that value is placed into `dep_slots` and the generator frame is suspended and pushed onto a teardown stack.
-   - Once the HTTP response is formulated (even if an exception or HTTP 4xx/5xx occurred), the `finally:` block in [_execute_route_inner](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/buckthorn/_core.pyx#L1373-L1379) iterates through the teardown stack in **LIFO order**, resuming each generator to ensure database transactions commit or roll back and connections cleanly return to their pools.
+   - Once the HTTP response is formulated (even if an exception or HTTP 4xx/5xx occurred), the `finally:` block in [_execute_route_inner](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/buckthorn/_core.pyx#L1373-L1379) iterates through the teardown stack in **LIFO order**, executing `next()` for sync generators and `aclose()` for async generators to ensure database transactions commit or roll back and connections cleanly return to their pools without blocking the C event loop.
 4. **Sub-Dependency Caching (`use_cache=True`):**
    - If multiple dependencies or route handlers depend on the same callable with `use_cache=True`, it executes exactly once per request. Subsequent steps read directly from the pre-computed `dep_slots` index.
 
@@ -127,6 +128,6 @@ if __name__ == "__main__":
 |---|---|---|---|
 | **Graph Resolution** | Dynamic recursive traversal on **every single request** | None (manual manual instantiation or third-party containers) | **Boot-time static compilation** into flattened DAG array |
 | **Execution Overhead** | Significant Python call stack overhead per request | High runtime overhead | **Direct array lookup** (`dep_slots[slot_index]`) in Cython |
-| **Generator Teardown** | Background generator iteration via async context managers | Manual `teardown_appcontext` hooks | **Compiled LIFO teardown stack** executed in Cython `finally:` |
-| **Type Support** | Sync & Async functions/generators | Typically sync only | **Native Sync, Async, and Generator callables** |
+| **Generator Teardown** | Background generator iteration via async context managers | Manual `teardown_appcontext` hooks | **Compiled LIFO teardown stack** (sync `next()` and non-blocking `aclose()`) |
+| **Type Support** | Sync & Async functions/generators | Typically sync only | **Native Sync, Async, and Generator callables** with eager execution |
 | **Per-Request Latency** | ~5 – 15 microseconds per dependency tree | High | **<0.5 microseconds** |

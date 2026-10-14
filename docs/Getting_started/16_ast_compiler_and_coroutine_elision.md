@@ -15,11 +15,12 @@ Imagine writing an instruction manual in English:
 ## 2. Technical Explanation
 1. **The AST Analyzer (`buckthorn.compiler`):**
    - Uses Python's native `ast` module to parse route handler syntax trees in [buckthorn/compiler.py](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/buckthorn/compiler.py).
-2. **Coroutine Elision:**
+2. **Coroutine Elision & Synergy with the 3-Tier Runtime:**
    - In modern Python APIs, developers frequently write `async def` out of habit, even for endpoints that perform in-memory computations, cache lookups, or call synchronous functions.
-   - Creating a Python coroutine object (`async def`) costs significant CPU cycles: allocating the coroutine frame, advancing it with `.send(None)`, and catching `StopIteration`.
+   - Creating a Python coroutine object (`async def`) costs CPU cycles: allocating the coroutine frame, advancing it with `.send(None)`, and catching `StopIteration`.
    - The AST transformer searches the function body for `ast.Await`, `ast.AsyncFor`, and `ast.AsyncWith`.
-   - **If no `await` statements are detected**, the compiler elides the coroutine, rewriting the function into a fast synchronous `cpdef` function. This completely eliminates coroutine frame allocation and task loop overhead.
+   - **If no `await` statements are detected**, the AOT compiler elides the coroutine at build time, rewriting the function into a fast synchronous `cpdef` C function (Tier 0). This completely eliminates coroutine frame allocation and task loop overhead (~300 ns execution time).
+   - **If `await` statements are detected (or in uncompiled dev mode)**, Buckthorn's runtime **3-Tier Eager Coroutine State Machine** takes over (see [Chapter 19: Native async/await & Suspension](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/docs/Getting_started/19_native_async_await_and_suspension.md)): running eagerly on the C stack (Tier 1) and only suspending non-blockingly via `BT_HANDLER_SUSPENDED = 2` when real I/O occurs (Tier 2).
 3. **Schema Struct Lowering:**
    - Identifies subclasses of `Schema` and converts them into Cython `cdef class` definitions.
    - Replaces dynamic Python `__dict__` attribute storage with static C struct offset fields (`cdef public int id`, `cdef public str username`).

@@ -18,6 +18,7 @@ Buckthorn uses a hybrid C11 and Cython 3.x architecture:
 2. **HTTP Framing:** Raw byte streams are parsed using `picohttpparser`, which uses Intel SSE4.2 SIMD vector instructions to find request boundaries in tens of nanoseconds.
 3. **Memory Management:** Each incoming request is processed inside a pre-allocated 64 KB C memory arena (`bt_arena_t`). Memory is allocated in sequential chunks and wiped clean in a single pointer reset upon request completion, bypassing the operating system's heap allocator (`malloc`/`free`).
 4. **Execution Bridge:** The compiled Cython layer (`_core.pyx`) communicates directly with C structs and function pointers, acquiring the Python Global Interpreter Lock (GIL) only when invoking user code.
+5. **3-Tier Eager Coroutine Engine:** Unlike traditional ASGI servers that unconditionally allocate an `asyncio.Task` on the Python heap for every request, Buckthorn executes `async def` endpoints eagerly via `coro.send(None)` directly on the C call stack. Endpoints that don't block run without task allocation overhead, while endpoints awaiting I/O suspend gracefully and yield control back to `libuv` (see [Chapter 19: Native async/await & Suspension](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/docs/Getting_started/19_native_async_await_and_suspension.md)).
 
 ---
 
@@ -63,7 +64,7 @@ if __name__ == "__main__":
 3. `@app.get("/")`:
    A decorator registering a route on the C `rax` radix tree for HTTP `GET` requests targeting the root path `/`.
 4. `def home(): return {...}`:
-   The route handler. Buckthorn accepts standard synchronous `def` functions as well as `async def` functions. The returned Python dictionary is automatically serialized into compact JSON bytes using C `yyjson`.
+   The route handler. Buckthorn accepts standard synchronous `def` functions as well as native `async def` functions. Thanks to Buckthorn's 3-Tier Eager Coroutine Engine, writing `async def` carries zero throughput penalty for fast paths (see [Chapter 19](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/docs/Getting_started/19_native_async_await_and_suspension.md)). The returned Python dictionary is automatically serialized into compact JSON bytes using C `yyjson`.
 5. `@app.get("/hello/{name}")`:
    Registers a dynamic parameterized path. The dynamic segment `{name}` is extracted in C and passed as a string parameter to `greet(name: str)`.
 6. `app.run(host="127.0.0.1", port=8000)`:
@@ -100,6 +101,7 @@ Transpiles `main.py` into native Cython code, applies coroutine elision, and com
 | Feature | Standard Python (FastAPI / Starlette) | Buckthorn |
 |---|---|---|
 | **Networking** | ASGI over asyncio / uvloop Python wrappers | Native C11 `libuv` event loop |
+| **Async Architecture** | Unconditional `asyncio.Task` allocation & event loop queue overhead | **3-Tier Eager-First State Machine** (zero Task allocation on eager completion) |
 | **HTTP Parser** | Python string decoding (`httptools` or pure Python) | Pure C SSE4.2 SIMD (`picohttpparser`) |
 | **Memory Allocation** | Dynamic Python object heap allocation per request | Pre-allocated 64 KB per-request C memory arena |
 | **Throughput (Single Core)** | ~15,000 – 30,000 req/sec | **>120,000 req/sec** (pure Python) / **>200,000 req/sec** (compiled) |

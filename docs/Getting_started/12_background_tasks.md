@@ -21,9 +21,9 @@ Buckthorn’s `BackgroundTasks` does exactly this: it sends the completed HTTP r
 2. **Task Registration (`add_task`):**
    - Calling `tasks.add_task(func, *args, **kwargs)` appends the callable, arguments, keyword arguments, and coroutine detection flag into an internal Cython list.
 3. **Post-Response Execution Timing:**
-   - In [_execute_route_inner](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/buckthorn/_core.pyx#L1376-L1379), the response status code, headers, and body are rendered and committed to the C output buffer **first**.
-   - In the `finally:` block, if `out_status_code[0] < 400`, Buckthorn executes `bg_runner._execute_all()`.
-   - Both synchronous callables (`def`) and asynchronous coroutines (`async def`) are executed sequentially without requiring an external message queue or Redis broker for simple in-process tasks.
+   - In [_execute_route_inner](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/buckthorn/_core.pyx#L1376-L1379), the response status code, headers, and body are rendered and committed to the C output buffer **first**, or flushed immediately via `bt_uv_complete_async_request()` for async routes.
+   - In the `finally:` block, if `out_status_code[0] < 400`, Buckthorn executes `bg_runner._execute_all()` for synchronous tasks or `_execute_all_async()` for asynchronous coroutine tasks.
+   - Synchronous callables (`def`) run inline after client response dispatch, while asynchronous coroutines (`async def`) are awaited non-blockingly via Buckthorn's `_drive_coro` / event-loop state machine without blocking the `libuv` loop or delaying client responses (see [Chapter 19: Native async/await](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/docs/Getting_started/19_native_async_await_and_suspension.md)).
 
 ---
 
@@ -104,5 +104,5 @@ if __name__ == "__main__":
 | **Memory Allocation** | Allocates new Python class instances and lists on standard heap | Not natively supported; requires Celery or RQ | **1,024-entry Cython freelist** (`@cython.freelist(1024)`) |
 | **Execution Trigger** | Starlette ASGI middleware wrapper iteration | Third-party background worker queues | **Direct Cython `finally:` invocation** |
 | **Caller Latency Impact** | Low, but adds Python asyncio queue overhead | High if run synchronously | **Zero added client latency** |
-| **Coroutine Handling** | Must run inside standard asyncio loop | N/A | **Native sync and compiled coroutine runner** |
+| **Coroutine Handling** | Must run inside standard asyncio loop with Task queue overhead | N/A | **Native sync and non-blocking compiled coroutine runner** |
 | **Setup Complexity** | Requires Starlette BackgroundTasks import | Requires Redis, Celery, and worker daemons | **Built directly into the core engine** |
