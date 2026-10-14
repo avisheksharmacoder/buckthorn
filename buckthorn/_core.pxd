@@ -317,3 +317,57 @@ cdef extern from "c_src/bt_security.h" nogil:
         bt_slice_t *out_pass
     )
 
+cdef extern from "c_src/bt_realtime.h" nogil:
+    enum:
+        BT_WS_OP_CONT
+        BT_WS_OP_TEXT
+        BT_WS_OP_BIN
+        BT_WS_OP_CLOSE
+        BT_WS_OP_PING
+        BT_WS_OP_PONG
+
+    ctypedef struct bt_ws_frame_t:
+        uint8_t fin
+        uint8_t opcode
+        uint8_t masked
+        const char *payload_ptr
+        size_t payload_len
+        size_t frame_total_len
+
+    ctypedef struct bt_multipart_part_t:
+        bt_slice_t field_name
+        bt_slice_t filename
+        bt_slice_t content_type
+        bt_slice_t data
+        int found
+
+    int bt_ws_compute_accept(
+        const char *client_key,
+        size_t client_key_len,
+        char *out_accept,
+        size_t out_cap,
+        size_t *out_len
+    )
+    int bt_ws_parse_frame(
+        char *buf,
+        size_t buf_len,
+        bt_ws_frame_t *out_frame
+    )
+    size_t bt_ws_encode_frame(
+        uint8_t opcode,
+        const char *payload,
+        size_t payload_len,
+        int mask_frame,
+        char *out_buf,
+        size_t out_cap
+    )
+    int bt_multipart_extract_file(
+        phr_header *headers,
+        size_t num_headers,
+        const char *body,
+        size_t body_len,
+        const char *target_field,
+        size_t target_field_len,
+        bt_multipart_part_t *out_part
+    )
+

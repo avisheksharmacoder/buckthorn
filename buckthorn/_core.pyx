@@ -4,6 +4,7 @@ from libc.string cimport memcpy
 from libc.stdio cimport snprintf
 from libc.stdint cimport int64_t, uint32_t
 from cpython.bytes cimport PyBytes_AsStringAndSize, PyBytes_FromStringAndSize
+from cpython.bytearray cimport PyByteArray_AsString
 from cpython.unicode cimport PyUnicode_DecodeUTF8, PyUnicode_AsUTF8AndSize
 from cpython.object cimport PyObject_GenericSetAttr, PyObject_GenericGetAttr
 import inspect
@@ -41,7 +42,11 @@ from buckthorn._core cimport (
     bt_jwt_verify_hs256, bt_verify_api_key, bt_verify_basic_auth,
     bt_middleware_chain_t, bt_router_get_mw,
     bt_middleware_configure_cors, bt_middleware_configure_ratelimit,
-    bt_middleware_configure_trusted_host, bt_middleware_configure_sec_headers
+    bt_middleware_configure_trusted_host, bt_middleware_configure_sec_headers,
+    BT_WS_OP_TEXT, BT_WS_OP_BIN, BT_WS_OP_CLOSE,
+    bt_ws_frame_t, bt_multipart_part_t,
+    bt_ws_compute_accept, bt_ws_parse_frame, bt_ws_encode_frame,
+    bt_multipart_extract_file
 )
 
 # Parameter Source Constants
@@ -52,18 +57,22 @@ DEF SRC_COOKIE      = 4
 DEF SRC_REQUEST     = 5
 DEF SRC_BODY_SCHEMA = 6
 DEF SRC_DEPENDS     = 7
-DEF SRC_SECURITY    = 8
+DEF SRC_SECURITY         = 8
+DEF SRC_UPLOAD_FILE      = 9
+DEF SRC_BACKGROUND_TASKS = 10
 
 # Parameter / Field Type Constants
-DEF TYPE_INT      = 1
-DEF TYPE_FLOAT    = 2
-DEF TYPE_STR      = 3
-DEF TYPE_REQUEST  = 4
-DEF TYPE_BOOL     = 5
-DEF TYPE_LIST     = 6
-DEF TYPE_SCHEMA   = 7
-DEF TYPE_DEPENDS  = 8
-DEF TYPE_SECURITY = 9
+DEF TYPE_INT              = 1
+DEF TYPE_FLOAT            = 2
+DEF TYPE_STR              = 3
+DEF TYPE_REQUEST          = 4
+DEF TYPE_BOOL             = 5
+DEF TYPE_LIST             = 6
+DEF TYPE_SCHEMA           = 7
+DEF TYPE_DEPENDS          = 8
+DEF TYPE_SECURITY         = 9
+DEF TYPE_UPLOAD_FILE      = 10
+DEF TYPE_BACKGROUND_TASKS = 11
 
 DEF SEC_KIND_JWT          = 1
 DEF SEC_KIND_APIKEY_HDR   = 2
@@ -182,6 +191,191 @@ cdef class HTTPBasicCredentials:
     def __cinit__(self, str username="", str password=""):
         self.username = username
         self.password = password
+
+
+@cython.freelist(1024)
+cdef class UploadFile:
+    """Zero-copy Cython wrapper around a multipart file slice."""
+    cdef public str filename
+    cdef public str content_type
+    cdef const char *_data_ptr
+    cdef size_t _data_len
+    cdef bytes _cached_bytes
+
+    def __cinit__(self, str filename="", str content_type="application/octet-stream"):
+        self.filename = filename
+        self.content_type = content_type
+        self._data_ptr = NULL
+        self._data_len = 0
+        self._cached_bytes = None
+
+    cdef inline void bind_slice(self, const char *ptr, size_t length) noexcept nogil:
+        self._data_ptr = ptr
+        self._data_len = length
+
+    @property
+    def size(self) -> int:
+        return <int>self._data_len
+
+    cpdef bytes read_sync(self):
+        if self._cached_bytes is None:
+            if self._data_ptr == NULL or self._data_len == 0:
+                self._cached_bytes = b""
+            else:
+                self._cached_bytes = PyBytes_FromStringAndSize(
+                    self._data_ptr, <Py_ssize_t>self._data_len
+                )
+        return self._cached_bytes
+
+    async def read(self) -> bytes:
+        return self.read_sync()
+
+
+@cython.freelist(1024)
+cdef class WebSocket:
+    """High-speed C-backed RFC 6455 WebSocket session & Pub/Sub handle."""
+    cdef public str path
+    cdef public bint accepted
+    cdef public bint closed
+    cdef public str accept_key
+    cdef public list _in_frames
+    cdef public list _out_frames
+    cdef public dict _pubsub_registry_ref
+
+    def __cinit__(self, str path="", dict pubsub_registry=None):
+        self.path = path
+        self.accepted = False
+        self.closed = False
+        self.accept_key = ""
+        self._in_frames = []
+        self._out_frames = []
+        self._pubsub_registry_ref = pubsub_registry
+
+    cpdef str compute_handshake(self, str sec_websocket_key):
+        cdef bytes b_key = sec_websocket_key.encode("ascii")
+        cdef char *k_ptr = NULL
+        cdef Py_ssize_t k_len = 0
+        cdef char out_accept[64]
+        cdef size_t out_len = 0
+        PyBytes_AsStringAndSize(b_key, &k_ptr, &k_len)
+        if bt_ws_compute_accept(k_ptr, <size_t>k_len, out_accept, sizeof(out_accept), &out_len) != 0:
+            raise ValueError("Invalid Sec-WebSocket-Key")
+        self.accept_key = PyUnicode_DecodeUTF8(out_accept, <Py_ssize_t>out_len, "strict")
+        return self.accept_key
+
+    async def accept(self):
+        self.accepted = True
+
+    cpdef void subscribe(self, str topic):
+        if self._pubsub_registry_ref is not None:
+            subs = self._pubsub_registry_ref.setdefault(topic, [])
+            if self not in subs:
+                subs.append(self)
+
+    cpdef void feed_raw_frame(self, bytes raw_frame):
+        """Parses and unmasks a raw client RFC 6455 frame in C using 64-bit XOR."""
+        cdef char stack_buf[4096]
+        cdef char *buf_ptr = NULL
+        cdef Py_ssize_t raw_len = 0
+        PyBytes_AsStringAndSize(raw_frame, &buf_ptr, &raw_len)
+        if raw_len > 4096:
+            mut_buf = bytearray(raw_frame)
+            buf_ptr = PyByteArray_AsString(mut_buf)
+        else:
+            memcpy(stack_buf, buf_ptr, <size_t>raw_len)
+            buf_ptr = stack_buf
+
+        cdef bt_ws_frame_t parsed
+        if bt_ws_parse_frame(buf_ptr, <size_t>raw_len, &parsed) != 0:
+            raise ValueError("Malformed RFC 6455 WebSocket frame")
+        if parsed.opcode == BT_WS_OP_CLOSE:
+            self.closed = True
+            return
+        cdef str text = PyUnicode_DecodeUTF8(
+            parsed.payload_ptr, <Py_ssize_t>parsed.payload_len, "strict"
+        )
+        self._in_frames.append(text)
+
+    async def receive_text(self) -> str:
+        if not self._in_frames:
+            raise RuntimeError("No WebSocket frame available")
+        return self._in_frames.pop(0)
+
+    cpdef bytes _encode_server_frame(self, str text):
+        cdef Py_ssize_t s_len = 0
+        cdef const char *s_ptr = PyUnicode_AsUTF8AndSize(text, &s_len)
+        cdef char frame_buf[16384]
+        cdef size_t written = bt_ws_encode_frame(
+            BT_WS_OP_TEXT, s_ptr, <size_t>s_len, 0, frame_buf, sizeof(frame_buf)
+        )
+        return PyBytes_FromStringAndSize(frame_buf, <Py_ssize_t>written)
+
+    async def send_text(self, str data):
+        self._out_frames.append(self._encode_server_frame(data))
+
+    cpdef void push_published_frame(self, bytes encoded_frame):
+        self._out_frames.append(encoded_frame)
+
+    cpdef str pop_outgoing_text(self):
+        if not self._out_frames:
+            raise RuntimeError("No outgoing WebSocket frame")
+        cdef bytes raw = self._out_frames.pop(0)
+        cdef char stack_buf[4096]
+        cdef char *buf_ptr = NULL
+        cdef Py_ssize_t raw_len = 0
+        PyBytes_AsStringAndSize(raw, &buf_ptr, &raw_len)
+        if raw_len > 4096:
+            mut_buf = bytearray(raw)
+            buf_ptr = PyByteArray_AsString(mut_buf)
+        else:
+            memcpy(stack_buf, buf_ptr, <size_t>raw_len)
+            buf_ptr = stack_buf
+
+        cdef bt_ws_frame_t parsed
+        bt_ws_parse_frame(buf_ptr, <size_t>raw_len, &parsed)
+        return PyUnicode_DecodeUTF8(parsed.payload_ptr, <Py_ssize_t>parsed.payload_len, "strict")
+
+    async def close(self, int code=1000):
+        self.closed = True
+
+
+cpdef bytes encode_client_masked_ws_frame(str text):
+    """Encodes a client-to-server masked RFC 6455 frame in C for testing."""
+    cdef Py_ssize_t s_len = 0
+    cdef const char *s_ptr = PyUnicode_AsUTF8AndSize(text, &s_len)
+    cdef char frame_buf[16384]
+    cdef size_t written = bt_ws_encode_frame(
+        BT_WS_OP_TEXT, s_ptr, <size_t>s_len, 1, frame_buf, sizeof(frame_buf)
+    )
+    return PyBytes_FromStringAndSize(frame_buf, <Py_ssize_t>written)
+
+
+@cython.freelist(1024)
+cdef class BackgroundTasks:
+    """Zero-overhead Cython freelist queue for post-response background tasks."""
+    cdef public list _tasks
+
+    def __cinit__(self):
+        self._tasks = []
+
+    def add_task(self, object func, *args, **kwargs):
+        cdef bint is_coro = inspect.iscoroutinefunction(func)
+        self._tasks.append((func, args, kwargs, is_coro))
+
+    cpdef void _execute_all(self):
+        cdef tuple task_entry
+        cdef object fn, args, kwargs, coro
+        cdef bint is_coro
+        for task_entry in self._tasks:
+            fn = task_entry[0]
+            args = task_entry[1]
+            kwargs = task_entry[2]
+            is_coro = <bint>(task_entry[3])
+            if is_coro:
+                coro = fn(*args, **kwargs)
+                _step_coroutine_sync(coro)
+            else:
+                fn(*args, **kwargs)
 
 
 cdef class CompiledSecuritySpec:
@@ -841,6 +1035,7 @@ cdef int _resolve_kwargs_for_specs(
     tuple param_specs,
     int num_params,
     list dep_slots,
+    list bg_tasks_out,
     const char *method, size_t method_len,
     const char *path, size_t path_len,
     const char *query, size_t query_len,
@@ -862,9 +1057,40 @@ cdef int _resolve_kwargs_for_specs(
     cdef Request req_obj
     cdef object schema_instance
     cdef object sec_val
+    cdef bt_multipart_part_t mp_part
+    cdef UploadFile up_file
+    cdef BackgroundTasks bg_obj
 
     for i in range(num_params):
         spec = <CompiledParamSpec>(param_specs[i])
+
+        if spec.source == SRC_BACKGROUND_TASKS:
+            bg_obj = BackgroundTasks.__new__(BackgroundTasks)
+            bg_obj._tasks = []
+            out_kwargs[spec.arg_name] = bg_obj
+            if bg_tasks_out is not None:
+                bg_tasks_out.append(bg_obj)
+            continue
+
+        if spec.source == SRC_UPLOAD_FILE:
+            if bt_multipart_extract_file(
+                headers, num_headers,
+                body, body_len,
+                spec._key_ptr, spec._key_len,
+                &mp_part
+            ) == 0:
+                if spec.required:
+                    _write_422_error(SRC_BODY_SCHEMA, spec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                    return 1
+                out_kwargs[spec.arg_name] = None
+                continue
+
+            up_file = UploadFile.__new__(UploadFile)
+            up_file.filename = PyUnicode_DecodeUTF8(mp_part.filename.ptr, <Py_ssize_t>mp_part.filename.len, "replace") if mp_part.filename.found else ""
+            up_file.content_type = PyUnicode_DecodeUTF8(mp_part.content_type.ptr, <Py_ssize_t>mp_part.content_type.len, "replace") if mp_part.content_type.found else "application/octet-stream"
+            up_file.bind_slice(mp_part.data.ptr, mp_part.data.len)
+            out_kwargs[spec.arg_name] = up_file
+            continue
 
         if spec.source == SRC_SECURITY:
             sec_val = _execute_c_security_spec(
@@ -1011,6 +1237,7 @@ cdef int _execute_route_inner(
     bt_slice_t *path_params, size_t num_path_params,
     const char *body, size_t body_len,
     char *out_body_buf, size_t *out_body_len,
+    char *out_extra_hdrs, size_t *out_extra_hdrs_len,
     int *out_status_code
 ) except -1:
     cdef object result
@@ -1024,6 +1251,9 @@ cdef int _execute_route_inner(
     cdef list teardown_stack = None
     cdef object dep_obj
     cdef object anext_coro
+    cdef object body_bytes_res, hdr_bytes_res, status_res
+    cdef list bg_tasks_list = []
+    cdef BackgroundTasks bg_runner
 
     try:
         if entry.num_dep_steps > 0:
@@ -1050,6 +1280,7 @@ cdef int _execute_route_inner(
                     dep_kwargs = {}
                     if _resolve_kwargs_for_specs(
                         dep_step.param_specs, dep_step.num_params, dep_slots,
+                        bg_tasks_list,
                         method, method_len, path, path_len, query, query_len,
                         headers, num_headers, path_params, num_path_params,
                         body, body_len, dep_kwargs,
@@ -1080,6 +1311,7 @@ cdef int _execute_route_inner(
             kwargs = {}
             if _resolve_kwargs_for_specs(
                 entry.param_specs, entry.num_params, dep_slots,
+                bg_tasks_list,
                 method, method_len, path, path_len, query, query_len,
                 headers, num_headers, path_params, num_path_params,
                 body, body_len, kwargs,
@@ -1093,6 +1325,20 @@ cdef int _execute_route_inner(
                 result = entry.fn(**kwargs)
 
         out_status_code[0] = entry.default_status_code
+
+        # Support EventSourceResponse (SSE) and FileResponse objects
+        if hasattr(result, "__bt_custom_response__"):
+            body_bytes_res, hdr_bytes_res, status_res = result._render_c_response()
+            out_status_code[0] = <int>status_res
+            PyBytes_AsStringAndSize(body_bytes_res, &raw_bytes_ptr, &raw_bytes_len)
+            memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
+            out_body_len[0] = <size_t>raw_bytes_len
+
+            if hdr_bytes_res:
+                PyBytes_AsStringAndSize(hdr_bytes_res, &raw_bytes_ptr, &raw_bytes_len)
+                memcpy(out_extra_hdrs, raw_bytes_ptr, <size_t>raw_bytes_len)
+                out_extra_hdrs_len[0] = <size_t>raw_bytes_len
+            return 0
 
         if entry.response_schema_spec is not None:
             return _serialize_schema_to_c_buf(result, entry.response_schema_spec, out_body_buf, out_body_len)
@@ -1127,6 +1373,9 @@ cdef int _execute_route_inner(
     finally:
         if teardown_stack is not None and len(teardown_stack) > 0:
             _teardown_generators(teardown_stack)
+        if len(bg_tasks_list) > 0 and out_status_code[0] < 400:
+            for bg_runner in bg_tasks_list:
+                bg_runner._execute_all()
 
 
 cdef class _RouteInvocationContext:
@@ -1145,6 +1394,8 @@ cdef class _RouteInvocationContext:
     cdef size_t body_len
     cdef char *out_body_buf
     cdef size_t *out_body_len
+    cdef char *out_extra_hdrs
+    cdef size_t *out_extra_hdrs_len
     cdef int *out_status_code
 
     cdef inline MiddlewareResponse execute_sync(self):
@@ -1152,7 +1403,9 @@ cdef class _RouteInvocationContext:
             self.entry, self.method, self.method_len, self.path, self.path_len,
             self.query, self.query_len, self.headers, self.num_headers,
             self.path_params, self.num_path_params,
-            self.body, self.body_len, self.out_body_buf, self.out_body_len, self.out_status_code
+            self.body, self.body_len, self.out_body_buf, self.out_body_len,
+            self.out_extra_hdrs, self.out_extra_hdrs_len,
+            self.out_status_code
         )
         if rc != 0:
             return MiddlewareResponse(500, b"Internal Server Error")
@@ -1188,7 +1441,9 @@ cdef int _cython_invoke_handler(
         return _execute_route_inner(
             entry, method, method_len, path, path_len, query, query_len,
             headers, num_headers, path_params, num_path_params,
-            body, body_len, out_body_buf, out_body_len, out_status_code
+            body, body_len, out_body_buf, out_body_len,
+            out_extra_hdrs, out_extra_hdrs_len,
+            out_status_code
         )
 
     # User @app.middleware("http") execution path
@@ -1214,6 +1469,8 @@ cdef int _cython_invoke_handler(
     ctx.body_len = body_len
     ctx.out_body_buf = out_body_buf
     ctx.out_body_len = out_body_len
+    ctx.out_extra_hdrs = out_extra_hdrs
+    ctx.out_extra_hdrs_len = out_extra_hdrs_len
     ctx.out_status_code = out_status_code
 
     async def _call_next_terminal(object _req=None):
@@ -1348,10 +1605,14 @@ cdef class CoreRouter:
     cdef list _handler_refs
     cdef CythonRingLogger _access_logger_ref
     cdef public list _user_middlewares
+    cdef public dict _ws_routes
+    cdef public dict _ws_pubsub
 
     def __cinit__(self):
         self._handler_refs = []
         self._user_middlewares = []
+        self._ws_routes = {}
+        self._ws_pubsub = {}
         self._router = bt_router_create(_cython_invoke_handler)
         if self._router == NULL:
             raise MemoryError("Failed to allocate C router")
@@ -1360,6 +1621,25 @@ cdef class CoreRouter:
         if self._router != NULL:
             bt_router_destroy(self._router)
             self._router = NULL
+
+    cpdef void add_ws_route(self, str path, object fn, list param_names):
+        self._ws_routes[path] = (fn, param_names)
+
+    cpdef void ws_publish(self, str topic, str message):
+        cdef list subs = self._ws_pubsub.get(topic)
+        if not subs:
+            return
+        cdef Py_ssize_t s_len = 0
+        cdef const char *s_ptr = PyUnicode_AsUTF8AndSize(message, &s_len)
+        cdef char frame_buf[16384]
+        cdef size_t written = bt_ws_encode_frame(
+            BT_WS_OP_TEXT, s_ptr, <size_t>s_len, 0, frame_buf, sizeof(frame_buf)
+        )
+        cdef bytes encoded = PyBytes_FromStringAndSize(frame_buf, <Py_ssize_t>written)
+        cdef WebSocket ws
+        for ws in subs:
+            if not ws.closed:
+                ws.push_published_frame(encoded)
 
     cpdef void add_route(
         self,

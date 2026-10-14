@@ -13,6 +13,7 @@ ext_modules = [
             "buckthorn/c_src/bt_logger.c",
             "buckthorn/c_src/bt_security.c",
             "buckthorn/c_src/bt_middleware.c",
+            "buckthorn/c_src/bt_realtime.c",
             "buckthorn/c_vendor/picohttpparser.c",
             "buckthorn/c_vendor/rax.c",
             "buckthorn/c_vendor/yyjson.c",

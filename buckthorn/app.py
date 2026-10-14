@@ -1,15 +1,33 @@
 # buckthorn/app.py
 import inspect
+import json as _py_json
 from typing import Any, Callable, Optional, Sequence, Type, get_type_hints
 from buckthorn._core import (
+    BackgroundTasks,
     CoreRouter,
     CompiledDepStep,
     CompiledParamSpec,
     Request,
+    UploadFile,
 )
-from buckthorn.params import DependsInfo, ParamInfo, PathInfo, QueryInfo, SecurityInfo, _UNDEFINED
-from buckthorn.schema import Schema
 from buckthorn.logging import RingLogger
+from buckthorn.openapi import (
+    build_openapi_schema,
+    get_scalar_ui_html,
+    get_swagger_ui_html,
+)
+from buckthorn.params import (
+    DependsInfo,
+    FileInfo,
+    ParamInfo,
+    PathInfo,
+    QueryInfo,
+    SecurityInfo,
+    _UNDEFINED,
+)
+from buckthorn.responses import HTMLResponse
+from buckthorn.routing import APIRouter, _join_paths
+from buckthorn.schema import Schema
 from buckthorn.security import SecurityBase
 
 _TYPE_MAP = {
@@ -17,6 +35,7 @@ _TYPE_MAP = {
     float: 2,    # TYPE_FLOAT
     str: 3,      # TYPE_STR
     Request: 4,  # TYPE_REQUEST
+    bool: 5,     # TYPE_BOOL
 }
 
 
@@ -62,8 +81,9 @@ def _compile_callable_params(
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             continue
 
-        raw_annotation = hints.get(arg_name, param.annotation)
-        annotation = str if raw_annotation is inspect.Parameter.empty else raw_annotation
+        annotation = hints.get(arg_name, param.annotation)
+        if annotation is inspect.Parameter.empty:
+            annotation = str
 
         default_obj = param.default
 
@@ -71,11 +91,10 @@ def _compile_callable_params(
         if isinstance(default_obj, DependsInfo):
             dep_fn = default_obj.dependency
             if dep_fn is None:
-                if raw_annotation is inspect.Parameter.empty:
+                if annotation is inspect.Parameter.empty:
                     raise ValueError(f"Depends() on '{arg_name}' requires a callable or type hint")
-                dep_fn = raw_annotation
+                dep_fn = annotation
 
-            # Fast C Security Guard Path (OpenSSL JWT / Constant-Time APIKey / Basic Auth)
             if isinstance(dep_fn, SecurityBase):
                 scopes = default_obj.scopes if isinstance(default_obj, SecurityInfo) else []
                 c_sec_spec = dep_fn.compile_c_spec(scopes=scopes)
@@ -119,7 +138,36 @@ def _compile_callable_params(
             )
             continue
 
-        # 3. Check if parameter is a `buckthorn.Schema` JSON body
+        # 3. Check if parameter is `BackgroundTasks`
+        if annotation is BackgroundTasks:
+            specs.append(
+                CompiledParamSpec(
+                    arg_name=arg_name,
+                    lookup_name=arg_name,
+                    source=10,      # SRC_BACKGROUND_TASKS
+                    param_type=11,  # TYPE_BACKGROUND_TASKS
+                    required=True,
+                )
+            )
+            continue
+
+        # 4. Check if parameter is an `UploadFile` / `File(...)` multipart field
+        if annotation is UploadFile or isinstance(default_obj, FileInfo):
+            required = True
+            if isinstance(default_obj, FileInfo):
+                required = default_obj.required
+            specs.append(
+                CompiledParamSpec(
+                    arg_name=arg_name,
+                    lookup_name=arg_name,
+                    source=9,       # SRC_UPLOAD_FILE
+                    param_type=10,  # TYPE_UPLOAD_FILE
+                    required=required,
+                )
+            )
+            continue
+
+        # 5. Check if parameter is a `buckthorn.Schema` JSON body
         if isinstance(annotation, type) and issubclass(annotation, Schema):
             specs.append(
                 CompiledParamSpec(
@@ -133,7 +181,7 @@ def _compile_callable_params(
             )
             continue
 
-        # 4. Path, Query, Header, or Cookie parameter
+        # 6. Path, Query, Header, or Cookie parameter
         param_type = _TYPE_MAP.get(annotation, 3)
 
         if isinstance(default_obj, ParamInfo):
@@ -180,7 +228,6 @@ def _register_dep_step(
     if use_cache and dep_callable in cache_slot_map:
         return cache_slot_map[dep_callable]
 
-    # Recursively compile sub-dependencies first (post-order topological sort)
     sub_param_specs = _compile_callable_params(
         path, dep_callable, dep_steps, cache_slot_map
     )
@@ -202,7 +249,6 @@ def _compile_route_plan(
     dep_steps: list[CompiledDepStep] = []
     cache_slot_map: dict[Any, int] = {}
 
-    # 1. Compile route-level / app-level `dependencies=[Depends(...)]` guards first
     if route_dependencies:
         for dep_info in route_dependencies:
             if isinstance(dep_info, DependsInfo) and dep_info.dependency is not None:
@@ -214,19 +260,31 @@ def _compile_route_plan(
                     cache_slot_map,
                 )
 
-    # 2. Compile endpoint signature parameters & nested `Depends(...)` DAG
     endpoint_param_specs = _compile_callable_params(
         path, endpoint, dep_steps, cache_slot_map
     )
     return endpoint_param_specs, dep_steps
 
 
+def _step_coro(coro: Any) -> Any:
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value
+    finally:
+        coro.close()
+
+
 class Buckthorn:
     def __init__(
         self,
         title: str = "Buckthorn",
-        version: str = "0.5.0",
+        version: str = "0.9.0",
         dependencies: Optional[Sequence[DependsInfo]] = None,
+        lifespan: Optional[Callable[[Any], Any]] = None,
+        openapi_url: Optional[str] = "/openapi.json",
+        docs_url: Optional[str] = "/docs",
+        scalar_url: Optional[str] = "/scalar",
         log_file: str = "",
         log_capacity: int = 65536,
         access_log: bool = False,
@@ -234,10 +292,61 @@ class Buckthorn:
         self.title = title
         self.version = version
         self.dependencies = list(dependencies) if dependencies else []
+        self.lifespan = lifespan
+        self._lifespan_ctx: Any = None
+        self.openapi_url = openapi_url
+        self.docs_url = docs_url
+        self.scalar_url = scalar_url
+
         self._core = CoreRouter()
         self.logger = RingLogger(filepath=log_file, capacity=log_capacity)
         if access_log:
             self._core.set_access_logger(self.logger._c_logger)
+
+        self._routes_meta: list[dict[str, Any]] = []
+        self._openapi_schema_cache: Optional[dict[str, Any]] = None
+        self._openapi_bytes_cache: Optional[bytes] = None
+
+        self._register_docs_routes()
+
+    def _register_docs_routes(self) -> None:
+        if self.openapi_url:
+            def _serve_openapi_json() -> bytes:
+                if self._openapi_bytes_cache is None:
+                    spec = self.openapi()
+                    self._openapi_bytes_cache = _py_json.dumps(
+                        spec, separators=(",", ":")
+                    ).encode("utf-8")
+                return self._openapi_bytes_cache
+
+            self._core.add_route("GET", self.openapi_url, _serve_openapi_json)
+
+        if self.docs_url and self.openapi_url:
+            swagger_resp = HTMLResponse(get_swagger_ui_html(self.title, self.openapi_url))
+            self._core.add_route("GET", self.docs_url, lambda: swagger_resp)
+
+        if self.scalar_url and self.openapi_url:
+            scalar_resp = HTMLResponse(get_scalar_ui_html(self.title, self.openapi_url))
+            self._core.add_route("GET", self.scalar_url, lambda: scalar_resp)
+
+    def openapi(self) -> dict[str, Any]:
+        if self._openapi_schema_cache is None:
+            self._openapi_schema_cache = build_openapi_schema(
+                self.title, self.version, self._routes_meta
+            )
+        return self._openapi_schema_cache
+
+    def _startup(self) -> None:
+        if self.lifespan is not None and self._lifespan_ctx is None:
+            self._lifespan_ctx = self.lifespan(self)
+            _step_coro(self._lifespan_ctx.__aenter__())
+
+    def _shutdown(self) -> None:
+        if self._lifespan_ctx is not None:
+            try:
+                _step_coro(self._lifespan_ctx.__aexit__(None, None, None))
+            finally:
+                self._lifespan_ctx = None
 
     def add_api_route(
         self,
@@ -247,7 +356,12 @@ class Buckthorn:
         response_model: Optional[Type[Schema]] = None,
         status_code: int = 200,
         dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
     ) -> None:
+        # Invalidate cached OpenAPI bytes when new routes are registered
+        self._openapi_schema_cache = None
+        self._openapi_bytes_cache = None
+
         combined_deps = list(self.dependencies)
         if dependencies:
             combined_deps.extend(dependencies)
@@ -259,8 +373,9 @@ class Buckthorn:
             else None
         )
         for method in methods:
+            m_upper = method.upper()
             self._core.add_route(
-                method.upper(),
+                m_upper,
                 path,
                 endpoint,
                 param_specs,
@@ -268,86 +383,49 @@ class Buckthorn:
                 status_code,
                 dep_steps,
             )
-
-    def get(
-        self,
-        path: str,
-        *,
-        response_model: Optional[Type[Schema]] = None,
-        status_code: int = 200,
-        dependencies: Optional[Sequence[DependsInfo]] = None,
-    ):
-        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self.add_api_route(
-                path,
-                fn,
-                ["GET"],
-                response_model=response_model,
-                status_code=status_code,
-                dependencies=dependencies,
+            self._routes_meta.append(
+                {
+                    "path": path,
+                    "method": m_upper,
+                    "endpoint": endpoint,
+                    "param_specs": param_specs,
+                    "response_model": response_model,
+                    "status_code": status_code,
+                    "tags": list(tags) if tags else [],
+                }
             )
-            return fn
-        return decorator
 
-    def post(
+    def include_router(
         self,
-        path: str,
+        router: APIRouter,
         *,
-        response_model: Optional[Type[Schema]] = None,
-        status_code: int = 200,
+        prefix: str = "",
+        tags: Optional[list[str]] = None,
         dependencies: Optional[Sequence[DependsInfo]] = None,
-    ):
-        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self.add_api_route(
-                path,
-                fn,
-                ["POST"],
-                response_model=response_model,
-                status_code=status_code,
-                dependencies=dependencies,
-            )
-            return fn
-        return decorator
+    ) -> None:
+        for r in router.routes:
+            full_path = _join_paths(prefix, r.path) if prefix else r.path
+            merged_deps: list[DependsInfo] = []
+            if dependencies:
+                merged_deps.extend(dependencies)
+            merged_deps.extend(r.dependencies)
 
-    def put(
-        self,
-        path: str,
-        *,
-        response_model: Optional[Type[Schema]] = None,
-        status_code: int = 200,
-        dependencies: Optional[Sequence[DependsInfo]] = None,
-    ):
-        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self.add_api_route(
-                path,
-                fn,
-                ["PUT"],
-                response_model=response_model,
-                status_code=status_code,
-                dependencies=dependencies,
-            )
-            return fn
-        return decorator
+            merged_tags: list[str] = []
+            if tags:
+                merged_tags.extend(tags)
+            for t in r.tags:
+                if t not in merged_tags:
+                    merged_tags.append(t)
 
-    def delete(
-        self,
-        path: str,
-        *,
-        response_model: Optional[Type[Schema]] = None,
-        status_code: int = 200,
-        dependencies: Optional[Sequence[DependsInfo]] = None,
-    ):
-        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             self.add_api_route(
-                path,
-                fn,
-                ["DELETE"],
-                response_model=response_model,
-                status_code=status_code,
-                dependencies=dependencies,
+                full_path,
+                r.endpoint,
+                r.methods,
+                response_model=r.response_model,
+                status_code=r.status_code,
+                dependencies=merged_deps,
+                tags=merged_tags,
             )
-            return fn
-        return decorator
 
     def add_middleware(self, middleware_cls: Any, **options: Any) -> None:
         mw_instance = middleware_cls(**options) if isinstance(middleware_cls, type) else middleware_cls
@@ -360,8 +438,107 @@ class Buckthorn:
             return fn
         return decorator
 
+    def websocket(self, path: str):
+        param_names = _extract_path_param_names(path)
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self._core.add_ws_route(path, fn, param_names)
+            return fn
+        return decorator
+
+    def ws_publish(self, topic: str, message: str) -> None:
+        self._core.ws_publish(topic, message)
+
+    def get(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+        dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
+    ):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(
+                path,
+                fn,
+                ["GET"],
+                response_model=response_model,
+                status_code=status_code,
+                dependencies=dependencies,
+                tags=tags,
+            )
+            return fn
+        return decorator
+
+    def post(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+        dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
+    ):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(
+                path,
+                fn,
+                ["POST"],
+                response_model=response_model,
+                status_code=status_code,
+                dependencies=dependencies,
+                tags=tags,
+            )
+            return fn
+        return decorator
+
+    def put(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+        dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
+    ):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(
+                path,
+                fn,
+                ["PUT"],
+                response_model=response_model,
+                status_code=status_code,
+                dependencies=dependencies,
+                tags=tags,
+            )
+            return fn
+        return decorator
+
+    def delete(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+        dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
+    ):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(
+                path,
+                fn,
+                ["DELETE"],
+                response_model=response_model,
+                status_code=status_code,
+                dependencies=dependencies,
+                tags=tags,
+            )
+            return fn
+        return decorator
+
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
+        self._startup()
         try:
             self._core.run_server(host, port)
-        except KeyboardInterrupt:
-            pass
+        finally:
+            self._shutdown()

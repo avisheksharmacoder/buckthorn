@@ -95,3 +95,11 @@ def Security(
     use_cache: bool = True,
 ) -> Any:
     return SecurityInfo(dependency=dependency, scopes=scopes, use_cache=use_cache)
+
+
+class FileInfo(ParamInfo):
+    source_id = 9  # SRC_UPLOAD_FILE
+
+
+def File(default: Any = _UNDEFINED, **kwargs: Any) -> Any:
+    return FileInfo(default=default, **kwargs)
