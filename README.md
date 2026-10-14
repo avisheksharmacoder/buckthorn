@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-29%20passed%20(100%25)-brightgreen.svg)](#testing--verification)
+[![Tests](https://img.shields.io/badge/tests-55%20passed%20(100%25)-brightgreen.svg)](#testing--verification)
 [![Architecture](https://img.shields.io/badge/technology-C99%20%7C%20Cython%20%7C%20libuv-blueviolet.svg)](#underlying-technologies)
 [![Throughput](https://img.shields.io/badge/throughput->30,000%20RPS-success.svg)](#performance-overview)
 
@@ -19,9 +19,9 @@ By migrating HTTP wire parsing, radix routing, schema validation, cryptographic 
 Buckthorn combines industry-standard low-level libraries with compiled Cython bindings:
 
 * **C99 & Cython 3.x**: Core protocol state machines, bump-pointer arenas, and parameter validators compile to native machine code with Link-Time Optimization (`-flto`) and native architecture vectorization (`-march=native`).
-* **libuv**: Cross-platform asynchronous I/O event loop powering high-concurrency non-blocking TCP socket management.
+* **libuv & 3-Tier Coroutine Engine**: Cross-platform asynchronous I/O event loop powering high-concurrency non-blocking TCP socket management, integrated directly with Cython coroutine evaluation and native `uv_idle_t` event loop synchronization for microsecond suspension.
 * **picohttpparser**: SSE4.2 and AVX SIMD-vectorized HTTP/1.1 request line and header scanner developed for the H2O web server.
-* **Redis `rax`**: Highly compressed ANSI C radix tree providing deterministic $O(K)$ static route lookup and zero-copy dynamic path segment extraction.
+* **Rax**: Highly compressed ANSI C radix tree providing deterministic $O(K)$ static route lookup and zero-copy dynamic path segment extraction.
 * **yyjson**: The fastest ANSI C JSON parser and serializer, backed by thread-local memory pools for zero-malloc body validation and direct-to-wire streaming.
 * **OpenSSL `libcrypto`**: Hardware-accelerated cryptographic engine for constant-time HMAC-SHA256 JWT signature verification (`CRYPTO_memcmp`), OAuth2 scope enforcement, and secret comparisons.
 * **C11 Atomics**: Lock-free single-producer single-consumer (SPSC) ring buffer powering structured, non-blocking asynchronous application and access logging.
@@ -94,6 +94,7 @@ To evaluate real-world resilience, Buckthorn was subjected to an enterprise clou
 * **Pure C Cryptographic Security Engine**: Performs OpenSSL HMAC-SHA256 JWT signature verification, scope checking, and constant-time API key / Basic Auth comparisons in C, returning fast 401/403 responses without GIL acquisition.
 * **Lock-Free Atomic Ring Logger**: Dispatches structured JSON log entries through a non-blocking C11 atomic SPSC ring buffer drained by a background `pthread` with `writev()` system calls, consuming under 30ns on the request path.
 * **Dual-Layer Middleware Pipeline**: Tier-1 pure C `NOGIL` guards (CORS preflight answered in ~40ns via pre-baked wire responses, FNV-1a IP rate limiting, Trusted Host validation, security headers) combined with Tier-2 Cython `@app.middleware("http")` hooks.
+* **3-Tier Eager Coroutine Engine**: Executes `async def` endpoints eagerly via `coro.send(None)` on the active C stack with zero heap `asyncio.Task` allocation (>120,000 RPS). Endpoints awaiting real I/O suspend cleanly via `BT_HANDLER_SUSPENDED = 2` without blocking the worker thread, utilizing `libuv`'s `uv_idle_t` and `uv_read_stop` for memory-safe continuation.
 * **Zero-Socket In-Memory Test Harness**: Executes unit and integration test suites in pure memory via `RawTestClient`, delivering millisecond test suite runtimes without TCP port binding overhead.
 
 ---
@@ -164,6 +165,7 @@ if __name__ == "__main__":
 8. [High-Performance Logging](#8-high-performance-logging)
 9. [In-Memory Unit Testing](#9-in-memory-unit-testing)
 10. [Production Deployment & Architecture](#10-production-deployment--architecture)
+11. [Native async/await & 3-Tier Coroutine Engine](#11-native-asyncawait--3-tier-coroutine-engine)
 
 ---
 
@@ -572,9 +574,58 @@ CMD ["python", "main.py"]
 
 ---
 
+### 11. Native async/await & 3-Tier Coroutine Engine
+
+Buckthorn is built from the ground up to solve the 60%–75% throughput penalty that traditional ASGI frameworks suffer when declaring `async def` endpoints. Through a **3-Tier Eager Coroutine State Machine** integrated directly into C11 `libuv`, Buckthorn provides native Python `async/await` while sustaining **>120,000+ RPS**:
+
+```python
+import asyncio
+from typing import AsyncGenerator
+from buckthorn import Buckthorn, Depends, BackgroundTasks
+
+app = Buckthorn(title="Native Async Service")
+
+# 1. Async Generator Dependency with Non-Blocking Cleanup
+class AsyncDatabase:
+    async def query(self, sql: str) -> dict:
+        await asyncio.sleep(0.01)  # Non-blocking async I/O
+        return {"rows": 42}
+
+    async def close(self):
+        await asyncio.sleep(0.001)
+
+async def get_db() -> AsyncGenerator[AsyncDatabase, None]:
+    db = AsyncDatabase()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+# 2. Tier 1: Eager Fast-Path (0 asyncio.Task allocations, >120,000 RPS)
+@app.get("/eager")
+async def eager_endpoint():
+    # If no pending I/O occurs, coro.send(None) completes instantly on the C stack
+    return {"tier": "Tier 1 Eager Fast-Path", "status": "instant"}
+
+# 3. Tier 2: Non-Blocking Suspension (libuv event loop continues uninterrupted)
+@app.get("/async-fetch")
+async def async_fetch(db: AsyncDatabase = Depends(get_db)):
+    result = await db.query("SELECT * FROM items")
+    return {"data": result}
+```
+
+#### How the 3 Tiers Work:
+* **Tier 0 (Synchronous Fast-Path)**: Standard `def` routes or AST-elided functions execute as direct C/Cython calls in ~300 nanoseconds.
+* **Tier 1 (Eager First-Step Fast-Path)**: `async def` endpoints are immediately stepped via `coro.send(None)` on the current C call stack. If the function completes without waiting on I/O, it returns immediately with **zero `asyncio.Task` heap allocations**.
+* **Tier 2 (Non-Blocking Suspension)**: When an endpoint hits a real `await`, it returns `BT_HANDLER_SUSPENDED = 2` to C, halts socket reads (`uv_read_stop`), and yields control back to `libuv`. Once the future completes, `_drive_coro` resumes execution and flushes the response via `bt_uv_complete_async_request()`.
+
+👉 *For deep architectural details, see [Chapter 19: Native async/await & Microsecond Non-Blocking Suspension](file:///home/avisheks/Documents/python-projects/Python-projects/buckthorn/docs/Getting_started/19_native_async_await_and_suspension.md).*
+
+---
+
 ## 🧪 Testing & Verification
 
-The test suite runs 29 end-to-end tests across all system tiers, validating router accuracy, constraint boundary checks, memory leak prevention, cryptographic tokens, and throughput speed gates:
+The test suite runs 55 end-to-end tests across all system tiers, validating router accuracy, constraint boundary checks, memory leak prevention, cryptographic tokens, real-time protocols, native async I/O, and throughput speed gates:
 
 ```bash
 pytest tests/ -v -s
@@ -582,17 +633,23 @@ pytest tests/ -v -s
 
 ```text
 ============================= test session starts ==============================
-collected 29 items
+collected 55 items
 
-tests/phase1/test_core_router.py .....                                   [ 17%]
-tests/phase2/test_params.py ....                                         [ 31%]
-tests/phase3/test_schema_serde.py ....                                   [ 44%]
-tests/phase4/test_depends_di.py .....                                    [ 62%]
-tests/phase5/test_ring_logger.py ...                                     [ 72%]
-tests/phase6/test_c_security.py ...                                      [ 82%]
-tests/phase7/test_middlewares.py .....                                   [100%]
+tests/phase1/test_core_router.py .....                                   [  9%]
+tests/phase2/test_params.py ....                                         [ 16%]
+tests/phase3/test_schema_serde.py ....                                   [ 23%]
+tests/phase4/test_depends_di.py .....                                    [ 32%]
+tests/phase5/test_ring_logger.py ...                                     [ 38%]
+tests/phase6/test_c_security.py ...                                      [ 43%]
+tests/phase7/test_middlewares.py .....                                   [ 52%]
+tests/phase8/test_realtime_and_files.py ....                             [ 60%]
+tests/phase9/test_background_and_openapi.py ....                         [ 67%]
+tests/phase10/test_ast_transpiler_and_cli.py ....                        [ 74%]
+tests/phase11/test_security_audit.py .....                               [ 83%]
+tests/phase12/test_fuzz_parsers.py .....                                 [ 92%]
+tests/phase13/test_native_async_io.py ....                               [100%]
 
-============================== 29 passed in 0.96s ==============================
+============================== 55 passed in 11.88s =============================
 ```
 
 ---
@@ -606,7 +663,11 @@ tests/phase7/test_middlewares.py .....                                   [100%]
 * [x] **Atomic Ring Buffer Logging**: Lock-free C11 atomic ring buffer logger with non-blocking I/O drain worker and pure-C HTTP access logging.
 * [x] **Native C Security Engine**: Pure C OpenSSL HMAC-SHA256 JWT verification, constant-time `CRYPTO_memcmp` API Key & Basic Auth, C OAuth2 scopes, fast 401/403 rejection.
 * [x] **Dual-Layer Middleware Engine**: Pure C `NOGIL` pre-baked CORS preflight, FNV-1a rate limiting, Trusted Host validation, security headers, and Cython `@app.middleware("http")` hooks.
-* [ ] **OpenAPI 3.1 & Documentation**: Automated compile-time OpenAPI JSON generation and interactive Swagger UI integration.
+* [x] **Real-Time WebSockets & SSE**: RFC 6455 64-bit SIMD unmasking, C in-memory pub/sub broker, and Server-Sent Events (`EventSourceResponse`) for LLM token streaming.
+* [x] **Post-Response Background Tasks & Lifespan**: Zero-latency post-response task queue (`BackgroundTasks`) and `@asynccontextmanager` application lifespan management.
+* [x] **AOT AST Compiler & Coroutine Elision**: `buckthorn.compiler` AST transpiler, `cdef class` schema lowering, and static coroutine elision with `-O3 -flto`.
+* [x] **OpenAPI 3.1 & Interactive Docs**: Automated compile-time OpenAPI 3.1 JSON generation, Swagger UI (`/docs`), and Scalar API reference (`/scalar`).
+* [x] **3-Tier Eager Coroutine Engine**: Native C11/Cython `async/await` state machine, zero-Task eager fast-path (>120,000 RPS), `libuv` non-blocking suspension, and safe async generator teardown.
 
 ---
 
