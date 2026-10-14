@@ -361,4 +361,7 @@ class Buckthorn:
         return decorator
 
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
-        self._core.run_server(host, port)
+        try:
+            self._core.run_server(host, port)
+        except KeyboardInterrupt:
+            pass

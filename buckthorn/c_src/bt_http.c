@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 #include <uv.h>
+#include <signal.h>
 
 static const char *RESP_400 =
     "HTTP/1.1 400 Bad Request\r\n"
@@ -437,6 +438,11 @@ static void on_new_connection(uv_stream_t *server, int status) {
     }
 }
 
+static void on_server_signal(uv_signal_t *handle, int signum) {
+    (void)signum;
+    uv_stop(handle->loop);
+}
+
 int bt_uv_server_run(bt_router_t *router, const char *host, int port) {
     uv_loop_t *loop = uv_default_loop();
     uv_tcp_t server;
@@ -456,5 +462,21 @@ int bt_uv_server_run(bt_router_t *router, const char *host, int port) {
     int r = uv_listen((uv_stream_t *)&server, 4096, on_new_connection);
     if (r) return r;
 
-    return uv_run(loop, UV_RUN_DEFAULT);
+    uv_signal_t sigint_handle;
+    uv_signal_init(loop, &sigint_handle);
+    uv_signal_start(&sigint_handle, on_server_signal, SIGINT);
+
+    uv_signal_t sigterm_handle;
+    uv_signal_init(loop, &sigterm_handle);
+    uv_signal_start(&sigterm_handle, on_server_signal, SIGTERM);
+
+    int ret = uv_run(loop, UV_RUN_DEFAULT);
+
+    uv_signal_stop(&sigint_handle);
+    uv_close((uv_handle_t *)&sigint_handle, NULL);
+    uv_signal_stop(&sigterm_handle);
+    uv_close((uv_handle_t *)&sigterm_handle, NULL);
+    uv_close((uv_handle_t *)&server, NULL);
+
+    return ret;
 }

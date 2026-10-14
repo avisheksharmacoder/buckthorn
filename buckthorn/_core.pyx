@@ -1388,7 +1388,11 @@ cdef class CoreRouter:
 
     cpdef void run_server(self, str host="0.0.0.0", int port=8000):
         cdef bytes b_host = host.encode("ascii")
-        bt_uv_server_run(self._router, <const char *>b_host, port)
+        cdef const char *c_host = <const char *>b_host
+        cdef int c_port = port
+        cdef bt_router_t *r = self._router
+        with nogil:
+            bt_uv_server_run(r, c_host, c_port)
 
     cpdef void set_access_logger(self, CythonRingLogger logger):
         self._access_logger_ref = logger
