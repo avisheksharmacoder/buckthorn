@@ -36,7 +36,9 @@ from buckthorn._core cimport (
     BT_LOG_VAL_INT, BT_LOG_VAL_FLOAT, BT_LOG_VAL_BOOL, BT_LOG_VAL_STR, BT_LOG_MAX_KVS,
     bt_logger_create, bt_logger_flush_and_stop, bt_logger_destroy,
     bt_logger_acquire_slot, bt_logger_publish_slot,
-    bt_router_set_access_logger
+    bt_router_set_access_logger,
+    bt_sec_result_t, BT_SEC_OK, BT_SEC_ERR_UNAUTHORIZED, BT_SEC_ERR_FORBIDDEN,
+    bt_jwt_verify_hs256, bt_verify_api_key, bt_verify_basic_auth
 )
 
 # Parameter Source Constants
@@ -47,16 +49,23 @@ DEF SRC_COOKIE      = 4
 DEF SRC_REQUEST     = 5
 DEF SRC_BODY_SCHEMA = 6
 DEF SRC_DEPENDS     = 7
+DEF SRC_SECURITY    = 8
 
 # Parameter / Field Type Constants
-DEF TYPE_INT     = 1
-DEF TYPE_FLOAT   = 2
-DEF TYPE_STR     = 3
-DEF TYPE_REQUEST = 4
-DEF TYPE_BOOL    = 5
-DEF TYPE_LIST    = 6
-DEF TYPE_SCHEMA  = 7
-DEF TYPE_DEPENDS = 8
+DEF TYPE_INT      = 1
+DEF TYPE_FLOAT    = 2
+DEF TYPE_STR      = 3
+DEF TYPE_REQUEST  = 4
+DEF TYPE_BOOL     = 5
+DEF TYPE_LIST     = 6
+DEF TYPE_SCHEMA   = 7
+DEF TYPE_DEPENDS  = 8
+DEF TYPE_SECURITY = 9
+
+DEF SEC_KIND_JWT          = 1
+DEF SEC_KIND_APIKEY_HDR   = 2
+DEF SEC_KIND_APIKEY_QUERY = 3
+DEF SEC_KIND_HTTP_BASIC   = 4
 
 # Dependency Callable Execution Kind Constants
 DEF DEP_SYNC_FUNC = 1
@@ -160,6 +169,88 @@ cdef class Request:
         if bt_find_query_param(self._query, self._query_len, k_ptr, <size_t>k_len, &val):
             return PyUnicode_DecodeUTF8(val.ptr, <Py_ssize_t>val.len, "replace")
         return None
+
+
+@cython.freelist(1024)
+cdef class HTTPBasicCredentials:
+    cdef public str username
+    cdef public str password
+
+    def __cinit__(self, str username="", str password=""):
+        self.username = username
+        self.password = password
+
+
+cdef class CompiledSecuritySpec:
+    cdef public int sec_kind
+    cdef public bytes b_secret
+    cdef const char *_secret_ptr
+    cdef size_t _secret_len
+
+    cdef public bytes b_key_name
+    cdef const char *_key_name_ptr
+    cdef size_t _key_name_len
+
+    cdef public bytes b_expected_val
+    cdef const char *_expected_val_ptr
+    cdef size_t _expected_val_len
+
+    cdef public bytes b_expected_pass
+    cdef const char *_expected_pass_ptr
+    cdef size_t _expected_pass_len
+
+    cdef public list _scope_bytes_refs
+    cdef const char *_scope_ptrs[8]
+    cdef size_t _scope_lens[8]
+    cdef size_t _num_scopes
+
+    def __cinit__(
+        self,
+        int sec_kind,
+        str secret="",
+        str key_name="",
+        str expected_val="",
+        str expected_pass="",
+        list scopes=None,
+    ):
+        cdef char *ptr = NULL
+        cdef Py_ssize_t length = 0
+        self.sec_kind = sec_kind
+
+        self.b_secret = secret.encode("utf-8")
+        PyBytes_AsStringAndSize(self.b_secret, &ptr, &length)
+        self._secret_ptr = <const char *>ptr
+        self._secret_len = <size_t>length
+
+        self.b_key_name = key_name.encode("utf-8")
+        PyBytes_AsStringAndSize(self.b_key_name, &ptr, &length)
+        self._key_name_ptr = <const char *>ptr
+        self._key_name_len = <size_t>length
+
+        self.b_expected_val = expected_val.encode("utf-8")
+        PyBytes_AsStringAndSize(self.b_expected_val, &ptr, &length)
+        self._expected_val_ptr = <const char *>ptr
+        self._expected_val_len = <size_t>length
+
+        self.b_expected_pass = expected_pass.encode("utf-8")
+        PyBytes_AsStringAndSize(self.b_expected_pass, &ptr, &length)
+        self._expected_pass_ptr = <const char *>ptr
+        self._expected_pass_len = <size_t>length
+
+        self._scope_bytes_refs = []
+        self._num_scopes = 0
+        cdef str sc
+        cdef bytes b_sc
+        if scopes:
+            for sc in scopes:
+                if self._num_scopes >= 8:
+                    break
+                b_sc = sc.encode("utf-8")
+                self._scope_bytes_refs.append(b_sc)
+                PyBytes_AsStringAndSize(b_sc, &ptr, &length)
+                self._scope_ptrs[self._num_scopes] = <const char *>ptr
+                self._scope_lens[self._num_scopes] = <size_t>length
+                self._num_scopes += 1
 
 
 cdef class CompiledFieldSpec:
@@ -271,6 +362,7 @@ cdef class CompiledParamSpec:
     cdef public bint required
     cdef public object default_val
     cdef public CompiledSchemaSpec schema_spec
+    cdef public CompiledSecuritySpec security_spec
 
     cdef public bint has_ge
     cdef public int64_t int_ge
@@ -310,6 +402,7 @@ cdef class CompiledParamSpec:
         object max_length=None,
         CompiledSchemaSpec schema_spec=None,
         int dep_slot_index=-1,
+        CompiledSecuritySpec security_spec=None,
     ):
         self.arg_name = arg_name
         self.lookup_key = lookup_name.encode("utf-8")
@@ -326,6 +419,7 @@ cdef class CompiledParamSpec:
         self.required = required
         self.default_val = default_val
         self.schema_spec = schema_spec
+        self.security_spec = security_spec
 
         self.has_ge = ge is not None
         if self.has_ge:
@@ -644,6 +738,87 @@ cdef int _serialize_dict_to_c_buf(
     return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
 
 
+cdef inline void _write_auth_error(
+    int status_code,
+    char *out_body_buf,
+    size_t *out_body_len,
+    int *out_status_code
+) noexcept nogil:
+    cdef const char *msg = (
+        '{"detail":"Not authenticated"}'
+        if status_code == 401
+        else '{"detail":"Not enough permissions"}'
+    )
+    cdef size_t mlen = 30 if status_code == 401 else 33
+    memcpy(out_body_buf, msg, mlen)
+    out_body_len[0] = mlen
+    out_status_code[0] = status_code
+
+
+cdef object _execute_c_security_spec(
+    CompiledSecuritySpec sec,
+    phr_header *headers,
+    size_t num_headers,
+    const char *query,
+    size_t query_len,
+    char *out_body_buf,
+    size_t *out_body_len,
+    int *out_status_code
+):
+    cdef bt_sec_result_t res
+    cdef char decode_buf[4096]
+    cdef size_t payload_len = 0
+    cdef bt_json_doc_t jdoc
+    cdef bt_slice_t slice_a
+    cdef bt_slice_t slice_b
+    cdef HTTPBasicCredentials creds
+
+    if sec.sec_kind == SEC_KIND_JWT:
+        res = bt_jwt_verify_hs256(
+            headers, num_headers,
+            sec._secret_ptr, sec._secret_len,
+            sec._scope_ptrs, sec._scope_lens, sec._num_scopes,
+            decode_buf, sizeof(decode_buf), &payload_len,
+            &jdoc
+        )
+        if res != BT_SEC_OK:
+            _write_auth_error(<int>res, out_body_buf, out_body_len, out_status_code)
+            return None
+        return _py_json.loads(PyBytes_FromStringAndSize(decode_buf, <Py_ssize_t>payload_len))
+
+    elif sec.sec_kind == SEC_KIND_APIKEY_HDR or sec.sec_kind == SEC_KIND_APIKEY_QUERY:
+        res = bt_verify_api_key(
+            headers, num_headers,
+            query, query_len,
+            1 if sec.sec_kind == SEC_KIND_APIKEY_QUERY else 0,
+            sec._key_name_ptr, sec._key_name_len,
+            sec._expected_val_ptr, sec._expected_val_len,
+            &slice_a
+        )
+        if res != BT_SEC_OK:
+            _write_auth_error(<int>res, out_body_buf, out_body_len, out_status_code)
+            return None
+        return PyUnicode_DecodeUTF8(slice_a.ptr, <Py_ssize_t>slice_a.len, "strict")
+
+    elif sec.sec_kind == SEC_KIND_HTTP_BASIC:
+        res = bt_verify_basic_auth(
+            headers, num_headers,
+            sec._expected_val_ptr, sec._expected_val_len,
+            sec._expected_pass_ptr, sec._expected_pass_len,
+            decode_buf, sizeof(decode_buf),
+            &slice_a, &slice_b
+        )
+        if res != BT_SEC_OK:
+            _write_auth_error(<int>res, out_body_buf, out_body_len, out_status_code)
+            return None
+        creds = HTTPBasicCredentials.__new__(HTTPBasicCredentials)
+        creds.username = PyUnicode_DecodeUTF8(slice_a.ptr, <Py_ssize_t>slice_a.len, "strict")
+        creds.password = PyUnicode_DecodeUTF8(slice_b.ptr, <Py_ssize_t>slice_b.len, "strict")
+        return creds
+
+    return None
+
+
 cdef int _resolve_kwargs_for_specs(
     tuple param_specs,
     int num_params,
@@ -668,9 +843,22 @@ cdef int _resolve_kwargs_for_specs(
     cdef double parsed_float = 0.0
     cdef Request req_obj
     cdef object schema_instance
+    cdef object sec_val
 
     for i in range(num_params):
         spec = <CompiledParamSpec>(param_specs[i])
+
+        if spec.source == SRC_SECURITY:
+            sec_val = _execute_c_security_spec(
+                spec.security_spec,
+                headers, num_headers,
+                query, query_len,
+                out_body_buf, out_body_len, out_status_code
+            )
+            if sec_val is None:
+                return 1
+            out_kwargs[spec.arg_name] = sec_val
+            continue
 
         if spec.source == SRC_DEPENDS:
             out_kwargs[spec.arg_name] = dep_slots[spec.dep_slot_index]

@@ -242,3 +242,50 @@ cdef extern from "c_src/bt_logger.h" nogil:
     bt_log_entry_t *bt_logger_acquire_slot(bt_logger_t *logger, uint8_t level,
                                            const char *msg, size_t msg_len)
     void bt_logger_publish_slot(bt_logger_t *logger)
+
+cdef extern from "c_src/bt_security.h" nogil:
+    ctypedef enum bt_sec_result_t:
+        BT_SEC_OK = 0
+        BT_SEC_ERR_UNAUTHORIZED = 401
+        BT_SEC_ERR_FORBIDDEN = 403
+
+    bt_sec_result_t bt_jwt_verify_hs256(
+        phr_header *headers,
+        size_t num_headers,
+        const char *secret,
+        size_t secret_len,
+        const char **req_scopes,
+        const size_t *req_scope_lens,
+        size_t num_req_scopes,
+        char *payload_buf,
+        size_t payload_buf_cap,
+        size_t *out_payload_len,
+        bt_json_doc_t *out_jdoc
+    )
+
+    bt_sec_result_t bt_verify_api_key(
+        phr_header *headers,
+        size_t num_headers,
+        const char *query,
+        size_t query_len,
+        int is_query,
+        const char *key_name,
+        size_t key_name_len,
+        const char *expected_val,
+        size_t expected_val_len,
+        bt_slice_t *out_key_slice
+    )
+
+    bt_sec_result_t bt_verify_basic_auth(
+        phr_header *headers,
+        size_t num_headers,
+        const char *expected_user,
+        size_t expected_user_len,
+        const char *expected_pass,
+        size_t expected_pass_len,
+        char *decode_buf,
+        size_t decode_buf_cap,
+        bt_slice_t *out_user,
+        bt_slice_t *out_pass
+    )
+

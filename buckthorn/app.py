@@ -7,9 +7,10 @@ from buckthorn._core import (
     CompiledParamSpec,
     Request,
 )
-from buckthorn.params import DependsInfo, ParamInfo, PathInfo, QueryInfo, _UNDEFINED
+from buckthorn.params import DependsInfo, ParamInfo, PathInfo, QueryInfo, SecurityInfo, _UNDEFINED
 from buckthorn.schema import Schema
 from buckthorn.logging import RingLogger
+from buckthorn.security import SecurityBase
 
 _TYPE_MAP = {
     int: 1,      # TYPE_INT
@@ -66,13 +67,29 @@ def _compile_callable_params(
 
         default_obj = param.default
 
-        # 1. Check if parameter is a `Depends(...)` injection
+        # 1. Check if parameter is a `Security(...)` or `Depends(...)` injection
         if isinstance(default_obj, DependsInfo):
             dep_fn = default_obj.dependency
             if dep_fn is None:
                 if raw_annotation is inspect.Parameter.empty:
                     raise ValueError(f"Depends() on '{arg_name}' requires a callable or type hint")
                 dep_fn = raw_annotation
+
+            # Fast C Security Guard Path (OpenSSL JWT / Constant-Time APIKey / Basic Auth)
+            if isinstance(dep_fn, SecurityBase):
+                scopes = default_obj.scopes if isinstance(default_obj, SecurityInfo) else []
+                c_sec_spec = dep_fn.compile_c_spec(scopes=scopes)
+                specs.append(
+                    CompiledParamSpec(
+                        arg_name=arg_name,
+                        lookup_name=arg_name,
+                        source=8,      # SRC_SECURITY
+                        param_type=9,  # TYPE_SECURITY
+                        required=True,
+                        security_spec=c_sec_spec,
+                    )
+                )
+                continue
 
             slot_idx = _register_dep_step(
                 path, dep_fn, default_obj.use_cache, dep_steps, cache_slot_map

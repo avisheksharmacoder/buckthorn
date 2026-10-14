@@ -1,5 +1,5 @@
 # buckthorn/params.py
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 _UNDEFINED = Ellipsis
 
@@ -74,3 +74,24 @@ def Cookie(default: Any = _UNDEFINED, **kwargs: Any) -> Any:
 
 def Depends(dependency: Optional[Callable[..., Any]] = None, *, use_cache: bool = True) -> Any:
     return DependsInfo(dependency=dependency, use_cache=use_cache)
+
+
+class SecurityInfo(DependsInfo):
+    def __init__(
+        self,
+        dependency: Optional[Callable[..., Any]] = None,
+        *,
+        scopes: Optional[Sequence[str]] = None,
+        use_cache: bool = True,
+    ):
+        super().__init__(dependency=dependency, use_cache=use_cache)
+        self.scopes = list(scopes) if scopes else []
+
+
+def Security(
+    dependency: Optional[Callable[..., Any]] = None,
+    *,
+    scopes: Optional[Sequence[str]] = None,
+    use_cache: bool = True,
+) -> Any:
+    return SecurityInfo(dependency=dependency, scopes=scopes, use_cache=use_cache)

@@ -11,6 +11,7 @@ ext_modules = [
             "buckthorn/c_src/bt_params.c",
             "buckthorn/c_src/bt_json.c",
             "buckthorn/c_src/bt_logger.c",
+            "buckthorn/c_src/bt_security.c",
             "buckthorn/c_vendor/picohttpparser.c",
             "buckthorn/c_vendor/rax.c",
             "buckthorn/c_vendor/yyjson.c",
@@ -20,7 +21,7 @@ ext_modules = [
             "buckthorn/c_src",
             "buckthorn/c_vendor",
         ],
-        libraries=["uv", "pthread"],
+        libraries=["uv", "pthread", "crypto"],
         extra_compile_args=[
             "-O3",
             "-march=native",
@@ -35,7 +36,7 @@ ext_modules = [
 
 setup(
     name="buckthorn",
-    version="0.5.0",
+    version="0.6.0",
     packages=find_packages(),
     ext_modules=cythonize(
         ext_modules,

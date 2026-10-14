@@ -2,7 +2,7 @@
 
 **Hyper-Performance Python Web Framework Powered by C99, Cython, and SIMD Hardware Acceleration.**
 
-[![Tests](https://img.shields.io/badge/tests-21%20passed%20(100%25)-brightgreen.svg)](#-test-suite--verification)
+[![Tests](https://img.shields.io/badge/tests-24%20passed%20(100%25)-brightgreen.svg)](#-test-suite--verification)
 [![Performance](https://img.shields.io/badge/throughput->430,000%20RPS-blueviolet.svg)](#-performance-benchmarks)
 [![Language](https://img.shields.io/badge/language-C99%20%7C%20Cython%20%7C%20Python-blue.svg)](#-why-buckthorn-is-so-fast-the-architecture)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -293,8 +293,11 @@ tests/phase4/test_depends_di.py::test_phase4_flattened_di_speed_gate PASSED
 tests/phase5/test_ring_logger.py::test_lock_free_ring_logger_structured_json_and_types PASSED
 tests/phase5/test_ring_logger.py::test_app_logger_and_pure_c_http_access_logging PASSED
 tests/phase5/test_ring_logger.py::test_ring_logger_hot_path_nanosecond_budget_and_rps_gate PASSED
+tests/phase6/test_c_security.py::test_c_openssl_jwt_verification_expiration_and_scopes PASSED
+tests/phase6/test_c_security.py::test_c_api_key_header_and_http_basic_auth PASSED
+tests/phase6/test_c_security.py::test_phase6_c_jwt_security_speed_gate PASSED
 
-============================== 21 passed in 0.59s ==============================
+============================== 24 passed in 0.99s ==============================
 ```
 
 ---
@@ -306,7 +309,7 @@ tests/phase5/test_ring_logger.py::test_ring_logger_hot_path_nanosecond_budget_an
 * [x] **High-Performance JSON Engine**: `buckthorn.Schema`, single-pass `yyjson` C pool parser, direct-to-buffer response serializer with `response_model` filtering.
 * [x] **Graph Dependency Injection**: Fast topological dependency injection (`Depends`) compiled ahead-of-time with $O(1)$ slot caching, LIFO teardown, and `HTTPException` support.
 * [x] **Atomic Ring Buffer Logging**: Lock-free C11 atomic ring buffer logger with non-blocking I/O drain worker and pure-C HTTP access logging.
-* [ ] **C Middleware & Security Engine**: Pure C middleware chain with hardware-accelerated OpenSSL JWT verification.
+* [x] **C Middleware & Security Engine**: Pure C OpenSSL HMAC-SHA256 JWT verification, constant-time `CRYPTO_memcmp` API Key & Basic Auth, C OAuth2 scopes, fast 401/403 rejection.
 * [ ] **Full Specification Generator**: Compile-time OpenAPI 3.1 schema generator and Swagger UI integration.
 
 ---
