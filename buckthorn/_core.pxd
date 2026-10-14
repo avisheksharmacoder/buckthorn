@@ -199,3 +199,46 @@ cdef extern from "c_src/bt_http.h" nogil:
         bt_raw_response_t *out_result
     )
     int bt_uv_server_run(bt_router_t *router, const char *host, int port)
+    void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger)
+
+cdef extern from "c_src/bt_logger.h" nogil:
+    enum:
+        BT_LOG_LEVEL_DEBUG
+        BT_LOG_LEVEL_INFO
+        BT_LOG_LEVEL_WARN
+        BT_LOG_LEVEL_ERROR
+        BT_LOG_VAL_INT
+        BT_LOG_VAL_FLOAT
+        BT_LOG_VAL_BOOL
+        BT_LOG_VAL_STR
+        BT_LOG_MAX_KVS
+
+    ctypedef union bt_log_val_union_t:
+        int64_t i_val
+        double f_val
+        int b_val
+        char s_val[48]
+
+    ctypedef struct bt_log_kv_t:
+        char key[24]
+        uint8_t key_len
+        uint8_t val_type
+        uint8_t str_len
+        bt_log_val_union_t v
+
+    ctypedef struct bt_log_entry_t:
+        uint8_t level
+        uint8_t msg_len
+        uint8_t num_kvs
+        char msg[96]
+        bt_log_kv_t kvs[4]
+
+    ctypedef struct bt_logger_t:
+        pass
+
+    bt_logger_t *bt_logger_create(const char *filepath, size_t capacity)
+    void bt_logger_flush_and_stop(bt_logger_t *logger)
+    void bt_logger_destroy(bt_logger_t *logger)
+    bt_log_entry_t *bt_logger_acquire_slot(bt_logger_t *logger, uint8_t level,
+                                           const char *msg, size_t msg_len)
+    void bt_logger_publish_slot(bt_logger_t *logger)

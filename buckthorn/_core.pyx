@@ -30,7 +30,13 @@ from buckthorn._core cimport (
     bt_json_writer_finish,
     bt_router_t, bt_raw_response_t,
     bt_router_create, bt_router_destroy, bt_router_insert,
-    bt_handle_http_bytes, bt_uv_server_run
+    bt_handle_http_bytes, bt_uv_server_run,
+    bt_logger_t, bt_log_entry_t, bt_log_kv_t,
+    BT_LOG_LEVEL_DEBUG, BT_LOG_LEVEL_INFO, BT_LOG_LEVEL_WARN, BT_LOG_LEVEL_ERROR,
+    BT_LOG_VAL_INT, BT_LOG_VAL_FLOAT, BT_LOG_VAL_BOOL, BT_LOG_VAL_STR, BT_LOG_MAX_KVS,
+    bt_logger_create, bt_logger_flush_and_stop, bt_logger_destroy,
+    bt_logger_acquire_slot, bt_logger_publish_slot,
+    bt_router_set_access_logger
 )
 
 # Parameter Source Constants
@@ -918,9 +924,97 @@ cdef int _cython_invoke_handler(
             _teardown_generators(teardown_stack)
 
 
+cdef class CythonRingLogger:
+    cdef bt_logger_t *_logger
+
+    def __cinit__(self, str filepath="", size_t capacity=65536):
+        cdef bytes b_path = filepath.encode("utf-8") if filepath else b""
+        cdef const char *c_path = <const char *>b_path if filepath else NULL
+        self._logger = bt_logger_create(c_path, capacity)
+        if self._logger == NULL:
+            raise MemoryError("Failed to initialize C11 RingLogger")
+
+    def __dealloc__(self):
+        if self._logger != NULL:
+            bt_logger_destroy(self._logger)
+            self._logger = NULL
+
+    cdef inline void _push_log(self, uint8_t level, str msg, dict kwargs):
+        if self._logger == NULL:
+            return
+        cdef Py_ssize_t msg_len = 0
+        cdef const char *msg_ptr = PyUnicode_AsUTF8AndSize(msg, &msg_len)
+        cdef bt_log_entry_t *slot = bt_logger_acquire_slot(
+            self._logger, level, msg_ptr, <size_t>msg_len
+        )
+        if slot == NULL:
+            return
+
+        cdef uint8_t kv_idx = 0
+        cdef object k, v
+        cdef const char *k_ptr = NULL
+        cdef Py_ssize_t k_len = 0
+        cdef const char *s_ptr = NULL
+        cdef Py_ssize_t s_len = 0
+        cdef size_t copy_klen, copy_slen
+        cdef bt_log_kv_t *kv
+
+        if kwargs is not None and len(kwargs) > 0:
+            for k, v in kwargs.items():
+                if kv_idx >= BT_LOG_MAX_KVS:
+                    break
+                if not isinstance(k, str):
+                    continue
+                k_ptr = PyUnicode_AsUTF8AndSize(k, &k_len)
+                kv = &slot.kvs[kv_idx]
+                copy_klen = <size_t>k_len if k_len < 23 else 23
+                memcpy(kv.key, k_ptr, copy_klen)
+                kv.key_len = <uint8_t>copy_klen
+
+                if isinstance(v, bool):
+                    kv.val_type = BT_LOG_VAL_BOOL
+                    kv.v.b_val = 1 if v else 0
+                    kv_idx += 1
+                elif isinstance(v, int):
+                    kv.val_type = BT_LOG_VAL_INT
+                    kv.v.i_val = <int64_t>v
+                    kv_idx += 1
+                elif isinstance(v, float):
+                    kv.val_type = BT_LOG_VAL_FLOAT
+                    kv.v.f_val = <double>v
+                    kv_idx += 1
+                elif isinstance(v, str):
+                    kv.val_type = BT_LOG_VAL_STR
+                    s_ptr = PyUnicode_AsUTF8AndSize(v, &s_len)
+                    copy_slen = <size_t>s_len if s_len < 47 else 47
+                    memcpy(kv.v.s_val, s_ptr, copy_slen)
+                    kv.str_len = <uint8_t>copy_slen
+                    kv_idx += 1
+
+        slot.num_kvs = kv_idx
+        bt_logger_publish_slot(self._logger)
+
+    def debug(self, str msg, **kwargs):
+        self._push_log(BT_LOG_LEVEL_DEBUG, msg, kwargs)
+
+    def info(self, str msg, **kwargs):
+        self._push_log(BT_LOG_LEVEL_INFO, msg, kwargs)
+
+    def warning(self, str msg, **kwargs):
+        self._push_log(BT_LOG_LEVEL_WARN, msg, kwargs)
+
+    def error(self, str msg, **kwargs):
+        self._push_log(BT_LOG_LEVEL_ERROR, msg, kwargs)
+
+    cpdef void flush_and_stop(self):
+        if self._logger != NULL:
+            bt_logger_flush_and_stop(self._logger)
+
+
 cdef class CoreRouter:
     cdef bt_router_t *_router
     cdef list _handler_refs
+    cdef CythonRingLogger _access_logger_ref
 
     def __cinit__(self):
         self._handler_refs = []
@@ -960,6 +1054,13 @@ cdef class CoreRouter:
     cpdef void run_server(self, str host="0.0.0.0", int port=8000):
         cdef bytes b_host = host.encode("ascii")
         bt_uv_server_run(self._router, <const char *>b_host, port)
+
+    cpdef void set_access_logger(self, CythonRingLogger logger):
+        self._access_logger_ref = logger
+        if logger is not None and logger._logger != NULL:
+            bt_router_set_access_logger(self._router, logger._logger)
+        else:
+            bt_router_set_access_logger(self._router, NULL)
 
 
 cdef class RawResponse:

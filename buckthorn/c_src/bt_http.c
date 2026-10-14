@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <uv.h>
 
 static const char *RESP_400 =
@@ -150,6 +151,18 @@ static inline const char *bt_status_reason(int status_code) {
     }
 }
 
+static inline int64_t bt_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger) {
+    if (router) {
+        router->access_logger = logger;
+    }
+}
+
 int bt_handle_http_bytes(
     bt_router_t *router,
     bt_arena_t *arena,
@@ -159,6 +172,7 @@ int bt_handle_http_bytes(
     size_t resp_wire_cap,
     bt_raw_response_t *out_result
 ) {
+    int64_t t_start_ns = router->access_logger ? bt_monotonic_ns() : 0;
     bt_arena_reset(arena);
 
     const char *method = NULL;
@@ -228,6 +242,12 @@ int bt_handle_http_bytes(
         out_result->http_wire_len = len;
         out_result->body_ptr = resp_wire_buf + (len - 9);
         out_result->body_len = 9;
+        if (router->access_logger) {
+            bt_logger_log_http_access(
+                router->access_logger, method, method_len,
+                path, clean_path_len, 404, bt_monotonic_ns() - t_start_ns
+            );
+        }
         bt_arena_reset(arena);
         return 0;
     }
@@ -279,6 +299,13 @@ int bt_handle_http_bytes(
     out_result->http_wire_len = (size_t)hdr_len + handler_out_len;
     out_result->body_ptr = resp_wire_buf + hdr_len;
     out_result->body_len = handler_out_len;
+
+    if (router->access_logger) {
+        bt_logger_log_http_access(
+            router->access_logger, method, method_len,
+            path, clean_path_len, status_code, bt_monotonic_ns() - t_start_ns
+        );
+    }
 
     bt_arena_reset(arena);
     return 0;

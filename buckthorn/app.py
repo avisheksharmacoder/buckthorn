@@ -9,6 +9,7 @@ from buckthorn._core import (
 )
 from buckthorn.params import DependsInfo, ParamInfo, PathInfo, QueryInfo, _UNDEFINED
 from buckthorn.schema import Schema
+from buckthorn.logging import RingLogger
 
 _TYPE_MAP = {
     int: 1,      # TYPE_INT
@@ -207,13 +208,19 @@ class Buckthorn:
     def __init__(
         self,
         title: str = "Buckthorn",
-        version: str = "0.4.0",
+        version: str = "0.5.0",
         dependencies: Optional[Sequence[DependsInfo]] = None,
+        log_file: str = "",
+        log_capacity: int = 65536,
+        access_log: bool = False,
     ):
         self.title = title
         self.version = version
         self.dependencies = list(dependencies) if dependencies else []
         self._core = CoreRouter()
+        self.logger = RingLogger(filepath=log_file, capacity=log_capacity)
+        if access_log:
+            self._core.set_access_logger(self.logger._c_logger)
 
     def add_api_route(
         self,
