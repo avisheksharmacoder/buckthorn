@@ -1169,7 +1169,7 @@ cdef inline void _write_auth_error(
         if status_code == 401
         else '{"detail":"Not enough permissions"}'
     )
-    cdef size_t mlen = 30 if status_code == 401 else 33
+    cdef size_t mlen = 30 if status_code == 401 else 35
     memcpy(out_body_buf, msg, mlen)
     out_body_len[0] = mlen
     out_status_code[0] = status_code
