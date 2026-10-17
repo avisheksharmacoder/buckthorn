@@ -1,6 +1,7 @@
 # buckthorn/compiler.py
 import ast
 import importlib.util
+import platform
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -259,10 +260,15 @@ def compile_pyx_module(
     pyx_file = work_path / f"{module_name}.pyx"
     pyx_file.write_text(pyx_code, encoding="utf-8")
 
+    extra_compile_args = ["-O3", "-march=native", "-flto", "-Wno-unused-function"]
+    if platform.machine() in ("x86_64", "AMD64"):
+        extra_compile_args.append("-msse4.2")
+
     ext = Extension(
         name=module_name,
         sources=[str(pyx_file)],
-        extra_compile_args=["-O3", "-march=native", "-msse4.2", "-Wno-unused-function"],
+        extra_compile_args=extra_compile_args,
+        extra_link_args=["-flto"],
     )
     ext_modules = cythonize(
         [ext],
@@ -273,6 +279,8 @@ def compile_pyx_module(
             "cdivision": True,
             "binding": True,
             "annotation_typing": False,
+            "initializedcheck": False,
+            "infer_types": True,
         },
         quiet=True,
     )
