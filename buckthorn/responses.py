@@ -57,17 +57,19 @@ class FileResponse:
         self.media_type = media_type
         self.filename = filename or os.path.basename(path)
         self.status_code = status_code
-
-    def _render_c_response(self) -> tuple[bytes, bytes, int]:
-        with open(self.path, "rb") as f:
-            body_bytes = f.read()
+        # Pre-sanitize media type and filename once at init to eliminate runtime string churn
         safe_media = str(self.media_type).replace("\r", "").replace("\n", "").replace("\0", "")
         safe_fn = str(self.filename).replace("\r", "").replace("\n", "").replace("\0", "").replace('"', "")
         hdr_str = (
             f"Content-Type: {safe_media}\r\n"
             f'Content-Disposition: attachment; filename="{safe_fn}"\r\n'
         )
-        return body_bytes, hdr_str.encode("utf-8"), self.status_code
+        self._cached_hdr_bytes = hdr_str.encode("utf-8")
+
+    def _render_c_response(self) -> tuple[bytes, bytes, int]:
+        with open(self.path, "rb") as f:
+            body_bytes = f.read()
+        return body_bytes, self._cached_hdr_bytes, self.status_code
 
 
 class HTMLResponse:

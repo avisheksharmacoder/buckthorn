@@ -89,6 +89,8 @@ class RawTestClient:
     def __init__(self, app: Buckthorn):
         self.app = app
         self._client = CythonRawTestClient(app._core)
+        # Direct Cython method binding to eliminate Python wrapper method lookup in benchmark loops
+        self.send_raw = self._client.send_raw
 
     def __enter__(self) -> "RawTestClient":
         self.app._startup()

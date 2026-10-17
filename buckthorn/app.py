@@ -1,4 +1,5 @@
 # buckthorn/app.py
+import asyncio
 import inspect
 import json as _py_json
 from typing import Any, Callable, Optional, Sequence, Type, get_type_hints
@@ -27,7 +28,7 @@ from buckthorn.params import (
 )
 from buckthorn.responses import HTMLResponse
 from buckthorn.routing import APIRouter, _join_paths
-from buckthorn.schema import Schema, get_schema_spec
+from buckthorn.schema import Schema, get_schema_spec, unwrap_type_annotation
 from buckthorn.security import SecurityBase
 
 _TYPE_MAP = {
@@ -172,30 +173,39 @@ def _compile_callable_params(
             continue
 
         # 5. Check if parameter is a `buckthorn.Schema` JSON body
-        schema_spec = get_schema_spec(annotation)
+        unwrapped_ann, is_optional = unwrap_type_annotation(annotation)
+        schema_spec = get_schema_spec(unwrapped_ann)
         if schema_spec is not None:
+            required = not is_optional if default_obj is inspect.Parameter.empty else (default_obj is _UNDEFINED)
             specs.append(
                 CompiledParamSpec(
                     arg_name=arg_name,
                     lookup_name=arg_name,
                     source=6,      # SRC_BODY_SCHEMA
                     param_type=7,  # TYPE_SCHEMA
-                    required=True,
+                    required=required,
                     schema_spec=schema_spec,
                 )
             )
             continue
 
         # 6. Path, Query, Header, or Cookie parameter
-        param_type = _TYPE_MAP.get(annotation, 3)
+        param_type = _TYPE_MAP.get(unwrapped_ann, 3)
 
         if isinstance(default_obj, ParamInfo):
             info = default_obj
+            if is_optional and info.required:
+                info.required = False
+                if info.default is _UNDEFINED:
+                    info.default = None
         elif arg_name in path_param_names:
             info = PathInfo()
         else:
+            default_val = _UNDEFINED if default_obj is inspect.Parameter.empty else default_obj
+            if is_optional and default_val is _UNDEFINED:
+                default_val = None
             info = QueryInfo(
-                default=_UNDEFINED if default_obj is inspect.Parameter.empty else default_obj
+                default=default_val
             )
 
         path_idx = path_param_names.index(arg_name) if arg_name in path_param_names else -1
@@ -272,12 +282,26 @@ def _compile_route_plan(
 
 
 def _step_coro(coro: Any) -> Any:
+    """
+    Drives a synchronous or multi-step asynchronous coroutine to completion.
+    Prevents premature cancellation of lifespan context managers that await real async I/O.
+    """
+    if not inspect.iscoroutine(coro):
+        return coro
+
     try:
-        coro.send(None)
-    except StopIteration as stop:
-        return stop.value
-    finally:
-        coro.close()
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+    if loop.is_running():
+        return asyncio.ensure_future(coro, loop=loop)
+    else:
+        return loop.run_until_complete(coro)
 
 
 class Buckthorn:
@@ -345,6 +369,11 @@ class Buckthorn:
         return self._openapi_schema_cache
 
     def _startup(self) -> None:
+        if self.openapi_url and self._openapi_bytes_cache is None:
+            # Pre-warm OpenAPI schema cache to avoid first-request generation latency
+            self._openapi_bytes_cache = _py_json.dumps(
+                self.openapi(), separators=(",", ":")
+            ).encode("utf-8")
         if self.lifespan is not None and self._lifespan_ctx is None:
             self._lifespan_ctx = self.lifespan(self)
             _step_coro(self._lifespan_ctx.__aenter__())

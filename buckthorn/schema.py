@@ -1,5 +1,6 @@
 # buckthorn/schema.py
-from typing import Any, Optional, Type, get_origin, get_type_hints
+import types
+from typing import Any, Optional, Type, Union, get_args, get_origin, get_type_hints
 from buckthorn._core import CompiledFieldSpec, CompiledSchemaSpec
 
 _UNDEFINED = Ellipsis
@@ -11,6 +12,21 @@ _SCHEMA_TYPE_MAP = {
     bool: 5,   # TYPE_BOOL
     list: 6,   # TYPE_LIST
 }
+
+
+def unwrap_type_annotation(annotation: Any) -> tuple[Any, bool]:
+    """
+    Unwraps typing.Union / Optional[T] / T | None into (inner_type, is_optional).
+    Resolves origin for parameterized types like list[int] -> list.
+    """
+    origin = get_origin(annotation)
+    is_union = origin is Union or (hasattr(types, "UnionType") and origin is types.UnionType)
+    if is_union:
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            inner_origin = get_origin(args[0]) or args[0]
+            return inner_origin, True
+    return origin or annotation, False
 
 # Global registry mapping both pure-Python Schema classes and compiled Cython cdef classes
 SCHEMA_SPEC_REGISTRY: dict[type, CompiledSchemaSpec] = {}
@@ -100,16 +116,23 @@ class Schema:
             if field_name.startswith("__"):
                 continue
 
-            origin = get_origin(annotation) or annotation
-            field_type = _SCHEMA_TYPE_MAP.get(origin, 3)
+            unwrapped_ann, is_optional = unwrap_type_annotation(annotation)
+            field_type = _SCHEMA_TYPE_MAP.get(unwrapped_ann, 3)
 
             raw_default = getattr(cls, field_name, _UNDEFINED)
             if isinstance(raw_default, FieldInfo):
                 finfo = raw_default
                 # Clean descriptor off the class so instance attribute lookup is unobstructed
                 delattr(cls, field_name)
+                if is_optional and finfo.required:
+                    finfo.required = False
+                    if finfo.default is _UNDEFINED:
+                        finfo.default = None
             else:
-                finfo = FieldInfo(default=raw_default)
+                default_val = raw_default
+                if is_optional and default_val is _UNDEFINED:
+                    default_val = None
+                finfo = FieldInfo(default=default_val)
 
             compiled_fields.append(
                 CompiledFieldSpec(
