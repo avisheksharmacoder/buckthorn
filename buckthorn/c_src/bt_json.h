@@ -11,6 +11,7 @@
 typedef struct {
     yyjson_doc *doc;
     yyjson_val *root;
+    yyjson_obj_iter iter;
 } bt_json_doc_t;
 
 /* Mutable JSON writer backed by zero-malloc C pool buffer */
@@ -21,6 +22,9 @@ typedef struct {
 
 /* Parse raw HTTP body bytes into a yyjson document using a zero-malloc C pool */
 int bt_json_parse_obj(const char *buf, size_t len, bt_json_doc_t *out_doc);
+
+/* Parse mutable buffer in-place using YYJSON_READ_INSITU */
+int bt_json_parse_obj_insitu(char *buf, size_t len, bt_json_doc_t *out_doc);
 
 /* Single-pass C field lookup + type check + constraint validation */
 bt_val_error_t bt_json_get_int64_checked(

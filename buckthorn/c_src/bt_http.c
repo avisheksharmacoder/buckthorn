@@ -7,35 +7,40 @@
 #include <uv.h>
 #include <signal.h>
 
-static const char *RESP_400 =
+static const char RESP_400[] =
     "HTTP/1.1 400 Bad Request\r\n"
     "Content-Length: 11\r\n"
     "Connection: close\r\n\r\n"
     "Bad Request";
+#define RESP_400_LEN (sizeof(RESP_400) - 1)
 
-static const char *RESP_404 =
+static const char RESP_404[] =
     "HTTP/1.1 404 Not Found\r\n"
     "Content-Length: 9\r\n"
     "Connection: keep-alive\r\n\r\n"
     "Not Found";
+#define RESP_404_LEN (sizeof(RESP_404) - 1)
 
-static const char *RESP_413 =
+static const char RESP_413[] =
     "HTTP/1.1 413 Content Too Large\r\n"
     "Content-Length: 17\r\n"
     "Connection: close\r\n\r\n"
     "Content Too Large";
+#define RESP_413_LEN (sizeof(RESP_413) - 1)
 
-static const char *RESP_414 =
+static const char RESP_414[] =
     "HTTP/1.1 414 URI Too Long\r\n"
     "Content-Length: 12\r\n"
     "Connection: close\r\n\r\n"
     "URI Too Long";
+#define RESP_414_LEN (sizeof(RESP_414) - 1)
 
-static const char *RESP_500 =
+static const char RESP_500[] =
     "HTTP/1.1 500 Internal Server Error\r\n"
     "Content-Length: 21\r\n"
     "Connection: close\r\n\r\n"
     "Internal Server Error";
+#define RESP_500_LEN (sizeof(RESP_500) - 1)
 
 static size_t split_url_segments(const char *path, size_t path_len, bt_slice_t *out_segs) {
     size_t count = 0;
@@ -91,6 +96,7 @@ int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
     /* If route contains '{', register in parameterized C segment matcher */
     if (memchr(path, '{', path_len) != NULL) {
         if (router->num_param_routes >= BT_MAX_PARAM_ROUTES) return -1;
+        if (method_len >= sizeof(router->param_routes[0].method)) return -1;
         bt_param_route_t *pr = &router->param_routes[router->num_param_routes++];
         memcpy(pr->method, method, method_len);
         pr->method[method_len] = '\0';
@@ -100,6 +106,7 @@ int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
         bt_slice_t segs[BT_MAX_PATH_SEGMENTS];
         pr->num_segments = split_url_segments(path, path_len, segs);
         for (size_t i = 0; i < pr->num_segments; i++) {
+            if (segs[i].len >= sizeof(pr->segments[i].seg_str)) return -1;
             pr->segments[i].seg_len = segs[i].len;
             memcpy(pr->segments[i].seg_str, segs[i].ptr, segs[i].len);
             pr->segments[i].seg_str[segs[i].len] = '\0';
@@ -190,6 +197,21 @@ void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger) {
     }
 }
 
+static inline char *bt_write_u64_ascii(char *p, size_t val) {
+    char tmp[24];
+    int i = 0;
+    if (val == 0) { *p++ = '0'; return p; }
+    while (val > 0) { tmp[i++] = (char)('0' + (val % 10)); val /= 10; }
+    while (i > 0) { *p++ = tmp[--i]; }
+    return p;
+}
+
+static const char HTTP_200_PREFIX[] = "HTTP/1.1 200 OK\r\nContent-Length: ";
+#define HTTP_200_PREFIX_LEN (sizeof(HTTP_200_PREFIX) - 1)
+
+static const char KEEP_ALIVE_LINE[] = "\r\nConnection: keep-alive\r\n";
+#define KEEP_ALIVE_LINE_LEN (sizeof(KEEP_ALIVE_LINE) - 1)
+
 static int bt_format_http_wire_response(
     bt_router_t *router,
     int status_code,
@@ -201,39 +223,52 @@ static int bt_format_http_wire_response(
     size_t resp_wire_cap,
     bt_raw_response_t *out_result
 ) {
-    const char *status_text = bt_status_reason(status_code);
+    if (resp_wire_cap < 128) goto wire_overflow;
 
-    int hdr_len = snprintf(
-        resp_wire_buf, resp_wire_cap,
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: keep-alive\r\n",
-        status_code, status_text, handler_out_len
-    );
-
-    if (hdr_len < 0 || (size_t)hdr_len >= resp_wire_cap) {
-        goto wire_overflow;
+    char *p = resp_wire_buf;
+    if (status_code == 200) {
+        memcpy(p, HTTP_200_PREFIX, HTTP_200_PREFIX_LEN);
+        p += HTTP_200_PREFIX_LEN;
+        p = bt_write_u64_ascii(p, handler_out_len);
+        memcpy(p, KEEP_ALIVE_LINE, KEEP_ALIVE_LINE_LEN);
+        p += KEEP_ALIVE_LINE_LEN;
+    } else {
+        const char *status_text = bt_status_reason(status_code);
+        size_t st_len = strlen(status_text);
+        memcpy(p, "HTTP/1.1 ", 9);
+        p += 9;
+        p = bt_write_u64_ascii(p, (size_t)status_code);
+        *p++ = ' ';
+        memcpy(p, status_text, st_len);
+        p += st_len;
+        memcpy(p, "\r\nContent-Length: ", 18);
+        p += 18;
+        p = bt_write_u64_ascii(p, handler_out_len);
+        memcpy(p, KEEP_ALIVE_LINE, KEEP_ALIVE_LINE_LEN);
+        p += KEEP_ALIVE_LINE_LEN;
     }
+
+    size_t hdr_len = (size_t)(p - resp_wire_buf);
 
     if (router->mw.cors_enabled && router->mw.cors_append_hdrs_len > 0) {
-        if ((size_t)hdr_len + router->mw.cors_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
+        if (hdr_len + router->mw.cors_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
         memcpy(resp_wire_buf + hdr_len, router->mw.cors_append_hdrs, router->mw.cors_append_hdrs_len);
-        hdr_len += (int)router->mw.cors_append_hdrs_len;
+        hdr_len += router->mw.cors_append_hdrs_len;
     }
     if (router->mw.sec_headers_enabled && router->mw.sec_append_hdrs_len > 0) {
-        if ((size_t)hdr_len + router->mw.sec_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
+        if (hdr_len + router->mw.sec_append_hdrs_len >= resp_wire_cap) goto wire_overflow;
         memcpy(resp_wire_buf + hdr_len, router->mw.sec_append_hdrs, router->mw.sec_append_hdrs_len);
-        hdr_len += (int)router->mw.sec_append_hdrs_len;
+        hdr_len += router->mw.sec_append_hdrs_len;
     }
     if (extra_hdrs_len > 0 && extra_hdrs_buf) {
-        if ((size_t)hdr_len + extra_hdrs_len >= resp_wire_cap) goto wire_overflow;
+        if (hdr_len + extra_hdrs_len >= resp_wire_cap) goto wire_overflow;
         memcpy(resp_wire_buf + hdr_len, extra_hdrs_buf, extra_hdrs_len);
-        hdr_len += (int)extra_hdrs_len;
+        hdr_len += extra_hdrs_len;
     }
 
-    if ((size_t)hdr_len + 2 + handler_out_len > resp_wire_cap) {
+    if (hdr_len + 2 + handler_out_len > resp_wire_cap) {
     wire_overflow: ;
-        size_t len = strlen(RESP_500);
+        size_t len = RESP_500_LEN;
         memcpy(resp_wire_buf, RESP_500, len);
         out_result->status_code = 500;
         out_result->http_wire_buf = resp_wire_buf;
@@ -251,7 +286,7 @@ static int bt_format_http_wire_response(
     }
     out_result->status_code = status_code;
     out_result->http_wire_buf = resp_wire_buf;
-    out_result->http_wire_len = (size_t)hdr_len + handler_out_len;
+    out_result->http_wire_len = hdr_len + handler_out_len;
     out_result->body_ptr = resp_wire_buf + hdr_len;
     out_result->body_len = handler_out_len;
     return 0;
@@ -287,7 +322,7 @@ int bt_handle_http_bytes_ex(
     );
 
     if (pret <= 0) {
-        size_t len = strlen(RESP_400);
+        size_t len = RESP_400_LEN;
         memcpy(resp_wire_buf, RESP_400, len);
         out_result->status_code = 400;
         out_result->http_wire_buf = resp_wire_buf;
@@ -309,7 +344,8 @@ int bt_handle_http_bytes_ex(
                                (audit_rc == BT_AUDIT_ERR_URI_TOO_LONG) ? RESP_414 : RESP_400;
         size_t b_len = (audit_rc == BT_AUDIT_ERR_PAYLOAD_TOO_LARGE) ? 17 :
                        (audit_rc == BT_AUDIT_ERR_URI_TOO_LONG) ? 12 : 11;
-        size_t w_len = strlen(err_wire);
+        size_t w_len = (audit_rc == BT_AUDIT_ERR_PAYLOAD_TOO_LARGE) ? RESP_413_LEN :
+                       (audit_rc == BT_AUDIT_ERR_URI_TOO_LONG) ? RESP_414_LEN : RESP_400_LEN;
         memcpy(resp_wire_buf, err_wire, w_len);
         out_result->status_code = (int)audit_rc;
         out_result->http_wire_buf = resp_wire_buf;
@@ -384,7 +420,7 @@ int bt_handle_http_bytes_ex(
     }
 
     if (handler_obj == raxNotFound) {
-        size_t len = strlen(RESP_404);
+        size_t len = RESP_404_LEN;
         memcpy(resp_wire_buf, RESP_404, len);
         out_result->status_code = 404;
         out_result->http_wire_buf = resp_wire_buf;
@@ -428,7 +464,7 @@ int bt_handle_http_bytes_ex(
     }
 
     if (rc != 0) {
-        size_t len = strlen(RESP_500);
+        size_t len = RESP_500_LEN;
         memcpy(resp_wire_buf, RESP_500, len);
         out_result->status_code = 500;
         out_result->http_wire_buf = resp_wire_buf;
@@ -491,6 +527,7 @@ typedef struct {
 
 static void on_alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
 static void on_uv_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
+static void on_uv_async_idle_tick(uv_idle_t *handle);
 
 static void on_client_close(uv_handle_t *handle) {
     bt_uv_client_t *client = (bt_uv_client_t *)handle->data;
@@ -577,6 +614,10 @@ static void on_uv_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) 
         if (rc == BT_HANDLER_SUSPENDED) {
             client->in_flight_async_reqs++;
             uv_read_stop(stream);
+            if (client->router && client->router->async_idler_handle && !client->router->async_idler_active) {
+                uv_idle_start((uv_idle_t *)client->router->async_idler_handle, on_uv_async_idle_tick);
+                client->router->async_idler_active = 1;
+            }
         } else {
             client->write_req.data = client;
             uv_buf_t wbuf = uv_buf_init(result.http_wire_buf, (unsigned int)result.http_wire_len);
@@ -593,7 +634,11 @@ static void on_uv_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) 
 static void on_uv_async_idle_tick(uv_idle_t *handle) {
     bt_router_t *router = (bt_router_t *)handle->data;
     if (router && router->tick_cb) {
-        router->tick_cb();
+        int pending = router->tick_cb();
+        if (pending <= 0 && router->async_idler_active) {
+            uv_idle_stop(handle);
+            router->async_idler_active = 0;
+        }
     }
 }
 
@@ -654,16 +699,17 @@ int bt_uv_server_run(bt_router_t *router, const char *host, int port) {
     uv_idle_t async_idler;
     uv_idle_init(loop, &async_idler);
     async_idler.data = router;
-    if (router->tick_cb) {
-        uv_idle_start(&async_idler, on_uv_async_idle_tick);
-    }
+    router->async_idler_handle = (void *)&async_idler;
+    router->async_idler_active = 0;
 
     int ret = uv_run(loop, UV_RUN_DEFAULT);
 
-    if (router->tick_cb) {
+    if (router->async_idler_active) {
         uv_idle_stop(&async_idler);
-        uv_close((uv_handle_t *)&async_idler, NULL);
+        router->async_idler_active = 0;
     }
+    router->async_idler_handle = NULL;
+    uv_close((uv_handle_t *)&async_idler, NULL);
 
     uv_signal_stop(&sigint_handle);
     uv_close((uv_handle_t *)&sigint_handle, NULL);

@@ -79,6 +79,8 @@ static int jwt_has_scope(yyjson_val *scopes_arr, const char *req_scope, size_t r
     return 0;
 }
 
+static _Thread_local HMAC_CTX *tls_hmac_ctx = NULL;
+
 bt_sec_result_t bt_jwt_verify_hs256(
     struct phr_header *headers,
     size_t num_headers,
@@ -116,32 +118,38 @@ bt_sec_result_t bt_jwt_verify_hs256(
     const char *dot2 = (const char *)memchr(dot1 + 1, '.', rem_len);
     if (!dot2) return BT_SEC_ERR_UNAUTHORIZED;
 
-    /* Verify JWT Header specifies "alg": "HS256" */
-    char hdr_json_buf[128];
-    size_t hdr_json_len = 0;
-    if (bt_base64url_decode(
-            tok, (size_t)(dot1 - tok),
-            (uint8_t *)hdr_json_buf, sizeof(hdr_json_buf) - 1, &hdr_json_len
-        ) != 0) {
-        return BT_SEC_ERR_UNAUTHORIZED;
-    }
-    hdr_json_buf[hdr_json_len] = '\0';
+    /* Fast path: canonical 36-byte HS256 header check avoids Base64URL decode and JSON parse */
+    size_t hdr_b64_len = (size_t)(dot1 - tok);
+    if (hdr_b64_len == 36 && memcmp(tok, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", 36) == 0) {
+        /* Standard HS256 header matched */
+    } else {
+        /* Fallback: decode and parse custom/non-standard JWT header */
+        char hdr_json_buf[128];
+        size_t hdr_json_len = 0;
+        if (bt_base64url_decode(
+                tok, hdr_b64_len,
+                (uint8_t *)hdr_json_buf, sizeof(hdr_json_buf) - 1, &hdr_json_len
+            ) != 0) {
+            return BT_SEC_ERR_UNAUTHORIZED;
+        }
+        hdr_json_buf[hdr_json_len] = '\0';
 
-    char hdr_pool[512];
-    yyjson_alc hdr_alc;
-    yyjson_alc_pool_init(&hdr_alc, hdr_pool, sizeof(hdr_pool));
-    yyjson_doc *hdr_doc = yyjson_read_opts(hdr_json_buf, hdr_json_len, 0, &hdr_alc, NULL);
-    if (!hdr_doc) {
-        return BT_SEC_ERR_UNAUTHORIZED;
-    }
-    yyjson_val *hdr_root = yyjson_doc_get_root(hdr_doc);
-    if (!hdr_root || !yyjson_is_obj(hdr_root)) {
-        return BT_SEC_ERR_UNAUTHORIZED;
-    }
-    yyjson_val *alg_val = yyjson_obj_getn(hdr_root, "alg", 3);
-    if (!alg_val || !yyjson_is_str(alg_val) ||
-        !bt_const_time_eq(yyjson_get_str(alg_val), yyjson_get_len(alg_val), "HS256", 5)) {
-        return BT_SEC_ERR_UNAUTHORIZED;
+        char hdr_pool[512];
+        yyjson_alc hdr_alc;
+        yyjson_alc_pool_init(&hdr_alc, hdr_pool, sizeof(hdr_pool));
+        yyjson_doc *hdr_doc = yyjson_read_opts(hdr_json_buf, hdr_json_len, 0, &hdr_alc, NULL);
+        if (!hdr_doc) {
+            return BT_SEC_ERR_UNAUTHORIZED;
+        }
+        yyjson_val *hdr_root = yyjson_doc_get_root(hdr_doc);
+        if (!hdr_root || !yyjson_is_obj(hdr_root)) {
+            return BT_SEC_ERR_UNAUTHORIZED;
+        }
+        yyjson_val *alg_val = yyjson_obj_getn(hdr_root, "alg", 3);
+        if (!alg_val || !yyjson_is_str(alg_val) ||
+            !bt_const_time_eq(yyjson_get_str(alg_val), yyjson_get_len(alg_val), "HS256", 5)) {
+            return BT_SEC_ERR_UNAUTHORIZED;
+        }
     }
 
     size_t signing_input_len = (size_t)(dot2 - tok);
@@ -157,15 +165,18 @@ bt_sec_result_t bt_jwt_verify_hs256(
         return BT_SEC_ERR_UNAUTHORIZED;
     }
 
-    /* 2. Compute HMAC-SHA256 using OpenSSL libcrypto */
+    /* 2. Compute HMAC-SHA256 reusing thread-local HMAC_CTX (zero malloc per request) */
     uint8_t mac[EVP_MAX_MD_SIZE];
     unsigned int mac_len = 0;
-    if (!HMAC(
-            EVP_sha256(),
-            secret, (int)secret_len,
-            (const unsigned char *)tok, signing_input_len,
-            mac, &mac_len
-        )) {
+    if (!tls_hmac_ctx) {
+        tls_hmac_ctx = HMAC_CTX_new();
+    }
+    if (!tls_hmac_ctx) {
+        return BT_SEC_ERR_UNAUTHORIZED;
+    }
+    if (HMAC_Init_ex(tls_hmac_ctx, secret, (int)secret_len, EVP_sha256(), NULL) != 1 ||
+        HMAC_Update(tls_hmac_ctx, (const unsigned char *)tok, signing_input_len) != 1 ||
+        HMAC_Final(tls_hmac_ctx, mac, &mac_len) != 1) {
         return BT_SEC_ERR_UNAUTHORIZED;
     }
 

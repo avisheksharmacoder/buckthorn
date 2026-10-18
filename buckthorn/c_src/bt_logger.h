@@ -41,12 +41,15 @@ typedef struct {
     bt_log_kv_t kvs[BT_LOG_MAX_KVS];
 } bt_log_entry_t;
 
+#include <stdalign.h>
+
 typedef struct {
     bt_log_entry_t *slots;
     size_t capacity;
     size_t mask;
-    _Atomic size_t write_idx;
-    _Atomic size_t read_idx;
+    _Alignas(64) _Atomic size_t write_idx;
+    size_t cached_read_idx;
+    _Alignas(64) _Atomic size_t read_idx;
     _Atomic int running;
     int fd;
     int owns_fd;

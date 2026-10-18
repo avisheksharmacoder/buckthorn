@@ -5,19 +5,21 @@
 #include <strings.h>
 #include <time.h>
 
-static const char *RESP_400_HOST =
+static const char RESP_400_HOST[] =
     "HTTP/1.1 400 Bad Request\r\n"
     "Content-Type: application/json\r\n"
     "Content-Length: 32\r\n"
     "Connection: keep-alive\r\n\r\n"
     "{\"detail\":\"Invalid Host header\"}";
+#define RESP_400_HOST_LEN (sizeof(RESP_400_HOST) - 1)
 
-static const char *RESP_429_RL =
+static const char RESP_429_RL[] =
     "HTTP/1.1 429 Too Many Requests\r\n"
     "Content-Type: application/json\r\n"
     "Content-Length: 30\r\n"
     "Connection: keep-alive\r\n\r\n"
     "{\"detail\":\"Too Many Requests\"}";
+#define RESP_429_RL_LEN (sizeof(RESP_429_RL) - 1)
 
 /* Fast 64-bit FNV-1a hash for client IP rate-limiting buckets */
 static inline uint64_t fnv1a_hash(const char *data, size_t len) {
@@ -54,14 +56,26 @@ void bt_middleware_configure_cors(
         (int)methods_len, allow_methods,
         (int)headers_len, allow_headers
     );
-    mw->cors_preflight_wire_len = pre_len > 0 ? (size_t)pre_len : 0;
+    if (pre_len < 0) {
+        mw->cors_preflight_wire_len = 0;
+    } else if ((size_t)pre_len >= sizeof(mw->cors_preflight_wire)) {
+        mw->cors_preflight_wire_len = sizeof(mw->cors_preflight_wire) - 1;
+    } else {
+        mw->cors_preflight_wire_len = (size_t)pre_len;
+    }
 
     int app_len = snprintf(
         mw->cors_append_hdrs, sizeof(mw->cors_append_hdrs),
         "Access-Control-Allow-Origin: %.*s\r\n",
         (int)origin_len, allow_origin
     );
-    mw->cors_append_hdrs_len = app_len > 0 ? (size_t)app_len : 0;
+    if (app_len < 0) {
+        mw->cors_append_hdrs_len = 0;
+    } else if ((size_t)app_len >= sizeof(mw->cors_append_hdrs)) {
+        mw->cors_append_hdrs_len = sizeof(mw->cors_append_hdrs) - 1;
+    } else {
+        mw->cors_append_hdrs_len = (size_t)app_len;
+    }
 }
 
 void bt_middleware_configure_ratelimit(
@@ -102,7 +116,13 @@ void bt_middleware_configure_sec_headers(
         (int)ctype_len, ctype_opts,
         (int)hsts_len, hsts
     );
-    mw->sec_append_hdrs_len = len > 0 ? (size_t)len : 0;
+    if (len < 0) {
+        mw->sec_append_hdrs_len = 0;
+    } else if ((size_t)len >= sizeof(mw->sec_append_hdrs)) {
+        mw->sec_append_hdrs_len = sizeof(mw->sec_append_hdrs) - 1;
+    } else {
+        mw->sec_append_hdrs_len = (size_t)len;
+    }
 }
 
 int bt_middleware_run_pre(
@@ -123,7 +143,7 @@ int bt_middleware_run_pre(
             if (!bt_find_header(headers, num_headers, "Host", 4, &host_hdr) ||
                 host_hdr.len != mw->allowed_host_len ||
                 strncasecmp(host_hdr.ptr, mw->allowed_host, mw->allowed_host_len) != 0) {
-                size_t len = strlen(RESP_400_HOST);
+                size_t len = RESP_400_HOST_LEN;
                 memcpy(resp_wire_buf, RESP_400_HOST, len);
                 *out_status_code = 400;
                 *out_wire_len = len;
@@ -169,7 +189,7 @@ int bt_middleware_run_pre(
         } else {
             b->count++;
             if (b->count > mw->rl_max_requests) {
-                size_t len = strlen(RESP_429_RL);
+                size_t len = RESP_429_RL_LEN;
                 memcpy(resp_wire_buf, RESP_429_RL, len);
                 *out_status_code = 429;
                 *out_wire_len = len;

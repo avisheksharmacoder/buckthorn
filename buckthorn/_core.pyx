@@ -543,6 +543,36 @@ cpdef bytes encode_client_masked_ws_frame(str text):
     return PyBytes_FromStringAndSize(frame_buf, <Py_ssize_t>written)
 
 
+cpdef bytes c_ws_encode_frame(int opcode, bytes payload, bint mask_frame=False):
+    """Encodes an arbitrary RFC 6455 frame in C supporting 16-bit and 64-bit lengths."""
+    cdef Py_ssize_t p_len = 0
+    cdef char *p_ptr = NULL
+    PyBytes_AsStringAndSize(payload, &p_ptr, &p_len)
+    cdef size_t ext_hdr = 8 if <size_t>p_len > 65535 else (2 if <size_t>p_len >= 126 else 0)
+    cdef size_t out_cap = 2 + ext_hdr + (4 if mask_frame else 0) + <size_t>p_len + 64
+    cdef bytearray out_ba = bytearray(out_cap)
+    cdef char *out_ptr = PyByteArray_AsString(out_ba)
+    cdef size_t written = bt_ws_encode_frame(
+        <uint8_t>opcode, p_ptr, <size_t>p_len, 1 if mask_frame else 0, out_ptr, out_cap
+    )
+    return bytes(out_ba[:written])
+
+
+cpdef tuple c_ws_parse_frame(bytes raw):
+    """Parses an RFC 6455 frame in C and returns (status, opcode, fin, payload)."""
+    cdef bytearray mut_buf = bytearray(raw)
+    cdef char *buf_ptr = PyByteArray_AsString(mut_buf)
+    cdef bt_ws_frame_t parsed
+    cdef int rc = bt_ws_parse_frame(buf_ptr, len(raw), &parsed)
+    if rc != 0:
+        return (rc, 0, 0, b"")
+    cdef bytes payload = PyBytes_FromStringAndSize(parsed.payload_ptr, <Py_ssize_t>parsed.payload_len)
+    return (0, parsed.opcode, parsed.fin, payload)
+
+WS_OP_TEXT = BT_WS_OP_TEXT
+WS_OP_BIN = BT_WS_OP_BIN
+
+
 @cython.freelist(1024)
 cdef class BackgroundTasks:
     """Zero-overhead Cython freelist queue for post-response background tasks."""

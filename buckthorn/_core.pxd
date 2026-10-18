@@ -18,6 +18,8 @@ cdef extern from "c_vendor/yyjson.h" nogil:
         pass
     ctypedef struct yyjson_mut_val:
         pass
+    ctypedef struct yyjson_obj_iter:
+        pass
 
     bint yyjson_is_null(yyjson_val *val)
     bint yyjson_is_bool(yyjson_val *val)
@@ -105,12 +107,14 @@ cdef extern from "c_src/bt_json.h" nogil:
     ctypedef struct bt_json_doc_t:
         yyjson_doc *doc
         yyjson_val *root
+        yyjson_obj_iter iter
 
     ctypedef struct bt_json_writer_t:
         yyjson_mut_doc *doc
         yyjson_mut_val *root
 
     int bt_json_parse_obj(const char *buf, size_t len, bt_json_doc_t *out_doc)
+    int bt_json_parse_obj_insitu(char *buf, size_t len, bt_json_doc_t *out_doc)
 
     bt_val_error_t bt_json_get_int64_checked(
         bt_json_doc_t *jdoc,

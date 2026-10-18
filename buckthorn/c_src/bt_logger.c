@@ -51,12 +51,16 @@ static const char *level_to_str(uint8_t level) {
 
 /* Formats a single bt_log_entry_t into a JSON line inside line_buf */
 static size_t format_entry_json(const bt_log_entry_t *e, char *line_buf, size_t cap) {
+    char clean_msg[sizeof(e->msg)];
+    size_t mlen = e->msg_len < (sizeof(clean_msg) - 1) ? e->msg_len : (sizeof(clean_msg) - 1);
+    bt_copy_json_safe(clean_msg, e->msg, mlen);
+
     int pos = snprintf(
         line_buf, cap,
         "{\"ts_ns\":%llu,\"level\":\"%s\",\"msg\":\"%.*s\"",
         (unsigned long long)e->ts_ns,
         level_to_str(e->level),
-        (int)e->msg_len, e->msg
+        (int)mlen, clean_msg
     );
     if (pos < 0 || (size_t)pos >= cap - 4) return 0;
 
@@ -185,12 +189,13 @@ bt_log_entry_t *bt_logger_acquire_slot(bt_logger_t *logger, uint8_t level,
     }
 
     size_t w = atomic_load_explicit(&logger->write_idx, memory_order_relaxed);
-    size_t r = atomic_load_explicit(&logger->read_idx, memory_order_acquire);
-
-    if (w - r >= logger->capacity) {
-        /* Ring buffer full: drop log rather than blocking the event loop! */
-        logger->dropped_count++;
-        return NULL;
+    if (w - logger->cached_read_idx >= logger->capacity) {
+        logger->cached_read_idx = atomic_load_explicit(&logger->read_idx, memory_order_acquire);
+        if (w - logger->cached_read_idx >= logger->capacity) {
+            /* Ring buffer full: drop log rather than blocking the event loop! */
+            logger->dropped_count++;
+            return NULL;
+        }
     }
 
     bt_log_entry_t *slot = &logger->slots[w & logger->mask];
@@ -199,7 +204,8 @@ bt_log_entry_t *bt_logger_acquire_slot(bt_logger_t *logger, uint8_t level,
     slot->num_kvs = 0;
 
     size_t copy_len = msg_len < (sizeof(slot->msg) - 1) ? msg_len : (sizeof(slot->msg) - 1);
-    bt_copy_json_safe(slot->msg, msg, copy_len);
+    memcpy(slot->msg, msg, copy_len);
+    slot->msg[copy_len] = '\0';
     slot->msg_len = (uint8_t)copy_len;
 
     return slot;

@@ -42,12 +42,14 @@ int bt_find_header(struct phr_header *headers, size_t num_headers,
     out_val->found = 0;
 
     for (size_t i = 0; i < num_headers; i++) {
-        if (headers[i].name && headers[i].name_len == key_len) {
-            if (strncasecmp(headers[i].name, key, key_len) == 0) {
-                out_val->ptr = headers[i].value;
-                out_val->len = headers[i].value_len;
-                out_val->found = 1;
-                return 1;
+        if (headers[i].name && headers[i].name_len == key_len && key_len > 0) {
+            if (((headers[i].name[0] ^ key[0]) & ~0x20) == 0) {
+                if (strncasecmp(headers[i].name, key, key_len) == 0) {
+                    out_val->ptr = headers[i].value;
+                    out_val->len = headers[i].value_len;
+                    out_val->found = 1;
+                    return 1;
+                }
             }
         }
     }
@@ -100,21 +102,55 @@ bt_val_error_t bt_parse_int64_checked(
     int has_lt, int64_t lt,
     int64_t *out_val
 ) {
-    if (!slice.found || slice.len == 0 || slice.len >= 63) {
-        return BT_ERR_TYPE_INT;
-    }
-    char buf[64];
-    memcpy(buf, slice.ptr, slice.len);
-    buf[slice.len] = '\0';
-
-    char *endptr = NULL;
-    errno = 0;
-    long long val = strtoll(buf, &endptr, 10);
-    if (errno != 0 || endptr != buf + slice.len) {
+    if (!slice.found || slice.len == 0 || !slice.ptr) {
         return BT_ERR_TYPE_INT;
     }
 
-    int64_t v = (int64_t)val;
+    const char *p = slice.ptr;
+    size_t rem = slice.len;
+    int negative = 0;
+
+    if (*p == '-') {
+        negative = 1;
+        p++;
+        rem--;
+    } else if (*p == '+') {
+        p++;
+        rem--;
+    }
+
+    if (rem == 0) {
+        return BT_ERR_TYPE_INT;
+    }
+
+    uint64_t acc = 0;
+    uint64_t limit = negative ? 9223372036854775808ULL : 9223372036854775807ULL;
+
+    while (rem > 0) {
+        char c = *p;
+        if (c < '0' || c > '9') {
+            return BT_ERR_TYPE_INT;
+        }
+        uint64_t d = (uint64_t)(c - '0');
+        if (acc > (limit - d) / 10ULL) {
+            return BT_ERR_TYPE_INT;
+        }
+        acc = acc * 10ULL + d;
+        p++;
+        rem--;
+    }
+
+    int64_t v;
+    if (negative) {
+        if (acc == 9223372036854775808ULL) {
+            v = INT64_MIN;
+        } else {
+            v = -(int64_t)acc;
+        }
+    } else {
+        v = (int64_t)acc;
+    }
+
     if (has_ge && v < ge) return BT_ERR_NUMBER_GE;
     if (has_le && v > le) return BT_ERR_NUMBER_LE;
     if (has_gt && v <= gt) return BT_ERR_NUMBER_GT;

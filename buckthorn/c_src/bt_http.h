@@ -61,6 +61,8 @@ typedef struct {
     bt_logger_t *access_logger;
     bt_middleware_chain_t mw;
     size_t max_body_size;
+    void *async_idler_handle;
+    int async_idler_active;
 } bt_router_t;
 
 typedef struct {

@@ -119,7 +119,16 @@ size_t bt_ws_encode_frame(
     char *out_buf,
     size_t out_cap
 ) {
-    size_t hdr_len = 2 + (payload_len >= 126 ? 2 : 0) + (mask_frame ? 4 : 0);
+    size_t ext_hdr_len = 0;
+    if (payload_len < 126) {
+        ext_hdr_len = 0;
+    } else if (payload_len <= 65535) {
+        ext_hdr_len = 2;
+    } else {
+        ext_hdr_len = 8;
+    }
+
+    size_t hdr_len = 2 + ext_hdr_len + (mask_frame ? 4 : 0);
     if (hdr_len + payload_len > out_cap) return 0;
 
     out_buf[0] = (char)(0x80 | (opcode & 0x0F)); /* FIN = 1 */
@@ -128,11 +137,17 @@ size_t bt_ws_encode_frame(
     size_t pos = 2;
     if (payload_len < 126) {
         out_buf[1] = (char)(mask_bit | (uint8_t)payload_len);
-    } else {
+    } else if (payload_len <= 65535) {
         out_buf[1] = (char)(mask_bit | 126);
         out_buf[2] = (char)((payload_len >> 8) & 0xFF);
         out_buf[3] = (char)(payload_len & 0xFF);
         pos = 4;
+    } else {
+        out_buf[1] = (char)(mask_bit | 127);
+        for (int i = 7; i >= 0; i--) {
+            out_buf[2 + (7 - i)] = (char)((payload_len >> (i * 8)) & 0xFF);
+        }
+        pos = 10;
     }
 
     uint8_t mask_key[4] = {0x37, 0xFA, 0x21, 0x3D};
@@ -151,17 +166,23 @@ size_t bt_ws_encode_frame(
     return pos + payload_len;
 }
 
-/* Portable C memmem helper for scanning multipart boundaries */
+/* Portable SIMD-accelerated memmem helper for scanning multipart boundaries */
 static const char *bt_memmem(const char *haystack, size_t hlen, const char *needle, size_t nlen) {
+#if defined(__GLIBC__) || defined(_GNU_SOURCE)
+    return (const char *)memmem(haystack, hlen, needle, nlen);
+#else
     if (nlen == 0) return haystack;
     if (hlen < nlen) return NULL;
-    const char *end = haystack + hlen - nlen + 1;
-    for (const char *p = haystack; p < end; p++) {
-        if (*p == *needle && memcmp(p, needle, nlen) == 0) {
-            return p;
-        }
+    const char *cur = haystack;
+    const char *end = haystack + hlen - nlen;
+    while (cur <= end) {
+        const char *cand = (const char *)memchr(cur, needle[0], (size_t)(end - cur + 1));
+        if (!cand) return NULL;
+        if (memcmp(cand, needle, nlen) == 0) return cand;
+        cur = cand + 1;
     }
     return NULL;
+#endif
 }
 
 int bt_multipart_extract_file(
