@@ -75,12 +75,21 @@ from buckthorn.security import (
     create_jwt_token,
 )
 
+import os
+
 # ---------------------------------------------------------------------------
 # Application Initialization & Middlewares
 # ---------------------------------------------------------------------------
+_enable_access_log = os.getenv("BUCKTHORN_ACCESS_LOG", "0") in ("1", "true", "True")
+_enable_app_log = os.getenv("BUCKTHORN_APP_LOG", "0") in ("1", "true", "True")
+_log_file = os.getenv("BUCKTHORN_LOG_FILE", "/tmp/buckthorn_bench.log")
+
 app = Buckthorn(
     title="Buckthorn Enterprise Commerce Benchmark",
     version="1.0.0",
+    access_log=_enable_access_log,
+    log_file=_log_file if (_enable_access_log or _enable_app_log) else "",
+    log_capacity=65536,
 )
 
 # Tier-1 Pre-Baked C Middlewares (Executed in C without GIL acquisition)
@@ -106,6 +115,8 @@ async def add_timing_and_telemetry(request: Request, call_next):
     elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
     response.headers["X-Process-Time-Us"] = f"{elapsed_us:.1f}"
     response.headers["X-Server-Node"] = "buckthorn-c-worker-01"
+    if _enable_app_log:
+        app.logger.info("request_completed", status=response.status_code, latency_us=elapsed_us)
     return response
 
 

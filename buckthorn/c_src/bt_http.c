@@ -523,6 +523,7 @@ typedef struct {
     uv_write_t write_req;
     int in_flight_async_reqs;
     int is_closing;
+    int handle_closed;
 } bt_uv_client_t;
 
 static void on_alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
@@ -531,11 +532,11 @@ static void on_uv_async_idle_tick(uv_idle_t *handle);
 
 static void on_client_close(uv_handle_t *handle) {
     bt_uv_client_t *client = (bt_uv_client_t *)handle->data;
+    if (!client) return;
+    client->handle_closed = 1;
     if (client->in_flight_async_reqs <= 0) {
         bt_arena_destroy(&client->arena);
         free(client);
-    } else {
-        client->is_closing = 1;
     }
 }
 
@@ -550,16 +551,10 @@ static void on_write_complete(uv_write_t *req, int status) {
     (void)status;
     bt_uv_client_t *client = (bt_uv_client_t *)req->data;
     if (!client) return;
-    if (client->is_closing) {
-        if (client->in_flight_async_reqs <= 0 && uv_is_closing((const uv_handle_t *)&client->handle)) {
-            bt_arena_destroy(&client->arena);
-            free(client);
-        }
+    if (client->is_closing || uv_is_closing((const uv_handle_t *)&client->handle)) {
         return;
     }
-    if (!uv_is_closing((const uv_handle_t *)&client->handle)) {
-        uv_read_start((uv_stream_t *)&client->handle, on_alloc_buffer, on_uv_read);
-    }
+    uv_read_start((uv_stream_t *)&client->handle, on_alloc_buffer, on_uv_read);
 }
 
 void bt_uv_complete_async_request(
@@ -574,11 +569,15 @@ void bt_uv_complete_async_request(
     bt_uv_client_t *client = (bt_uv_client_t *)async_client_ctx;
     client->in_flight_async_reqs--;
 
-    if (client->is_closing || uv_is_closing((const uv_handle_t *)&client->handle)) {
+    if (client->handle_closed) {
         if (client->in_flight_async_reqs <= 0) {
             bt_arena_destroy(&client->arena);
             free(client);
         }
+        return;
+    }
+
+    if (client->is_closing || uv_is_closing((const uv_handle_t *)&client->handle)) {
         return;
     }
 
@@ -594,7 +593,13 @@ void bt_uv_complete_async_request(
 
     client->write_req.data = client;
     uv_buf_t wbuf = uv_buf_init(result.http_wire_buf, (unsigned int)result.http_wire_len);
-    uv_write(&client->write_req, (uv_stream_t *)&client->handle, &wbuf, 1, on_write_complete);
+    int w_rc = uv_write(&client->write_req, (uv_stream_t *)&client->handle, &wbuf, 1, on_write_complete);
+    if (w_rc != 0) {
+        client->is_closing = 1;
+        if (!uv_is_closing((const uv_handle_t *)&client->handle)) {
+            uv_close((uv_handle_t *)&client->handle, on_client_close);
+        }
+    }
 }
 
 static void on_uv_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
@@ -621,7 +626,13 @@ static void on_uv_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) 
         } else {
             client->write_req.data = client;
             uv_buf_t wbuf = uv_buf_init(result.http_wire_buf, (unsigned int)result.http_wire_len);
-            uv_write(&client->write_req, stream, &wbuf, 1, on_write_complete);
+            int w_rc = uv_write(&client->write_req, stream, &wbuf, 1, on_write_complete);
+            if (w_rc != 0) {
+                client->is_closing = 1;
+                if (!uv_is_closing((const uv_handle_t *)stream)) {
+                    uv_close((uv_handle_t *)stream, on_client_close);
+                }
+            }
         }
     } else if (nread < 0) {
         client->is_closing = 1;
@@ -652,6 +663,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
     client->router = router;
     client->in_flight_async_reqs = 0;
     client->is_closing = 0;
+    client->handle_closed = 0;
 
     uv_tcp_init(server->loop, &client->handle);
     client->handle.data = client;
