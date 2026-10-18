@@ -48,6 +48,8 @@ Real-world benchmark measurements executed on an **Intel® Core™ i5-10210U CPU
 > python benchmarks/verify_overview.py
 > ```
 > *Source benchmark file:* [`benchmarks/verify_overview.py`](benchmarks/verify_overview.py) (exercises in-memory SSE4.2 SIMD parsing, C radix routing, single-pass `yyjson`, DAG dependency injection, and OpenSSL HMAC verification).
+>
+> 📖 **Complete Benchmark Records**: For comprehensive single-worker (`wrk -t1`) network benchmarks, AOT compiled mode numbers, and the 10-Phase Speed Gates verification report, see [Preliminary Tests & Benchmark Records](docs/buckthorn-docs/preliminary_tests.md).
 
 ### 📊 Production Realistic Mixed-Traffic Benchmark (`wrk`)
 
