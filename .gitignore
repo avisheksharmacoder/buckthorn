@@ -11,6 +11,9 @@ __pycache__/
 *.pyd
 *.a
 
+# temporary argon reports. 
+/argonreport/
+
 # Cython generated C/C++ files and annotations (preserves c_src/ and c_vendor/)
 buckthorn/_core.c
 buckthorn/_core.cpp

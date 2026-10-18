@@ -3,6 +3,7 @@ cimport cython
 from libc.string cimport memcpy
 from libc.stdio cimport snprintf
 from libc.stdint cimport int64_t, uint32_t, uintptr_t
+from cpython.ref cimport PyObject
 from cpython.bytes cimport PyBytes_AsStringAndSize, PyBytes_FromStringAndSize
 from cpython.bytearray cimport PyByteArray_AsString
 from cpython.unicode cimport PyUnicode_DecodeUTF8, PyUnicode_AsUTF8AndSize
@@ -58,7 +59,11 @@ from buckthorn._core cimport (
     bt_ws_compute_accept, bt_ws_parse_frame, bt_ws_encode_frame,
     bt_multipart_extract_file,
     bt_router_set_max_body_size,
-    bt_sanitize_header_str
+    bt_sanitize_header_str,
+    yyjson_arr_iter, yyjson_obj_iter_init, yyjson_obj_iter_next, yyjson_obj_iter_get_val,
+    yyjson_arr_iter_init, yyjson_arr_iter_next,
+    PyIter_Send, PySendResult, PYGEN_RETURN, PYGEN_ERROR, PYGEN_NEXT, PyUnicode_InternInPlace,
+    Py_DECREF_ptr, PyCoro_CheckExact
 )
 
 # Parameter Source Constants
@@ -118,11 +123,12 @@ cdef inline int _detect_callable_kind(object fn):
 
 
 cdef object _SHARED_ASYNC_LOOP = None
+cdef bint _LOOP_READY = False
 cdef int _PENDING_ASYNC_TASKS = 0
 
 cdef inline object _get_or_create_async_loop():
-    global _SHARED_ASYNC_LOOP
-    if _SHARED_ASYNC_LOOP is None or _SHARED_ASYNC_LOOP.is_closed():
+    global _SHARED_ASYNC_LOOP, _LOOP_READY
+    if not _LOOP_READY or _SHARED_ASYNC_LOOP is None or _SHARED_ASYNC_LOOP.is_closed():
         if _HAS_UVLOOP:
             _SHARED_ASYNC_LOOP = uvloop.new_event_loop()
         else:
@@ -133,6 +139,7 @@ cdef inline object _get_or_create_async_loop():
                 _SHARED_ASYNC_LOOP.set_task_factory(asyncio.eager_task_factory)
             except Exception:
                 pass
+        _LOOP_READY = True
     return _SHARED_ASYNC_LOOP
 
 cdef object _drive_coro(object coro, object initial_fut, object loop):
@@ -173,18 +180,19 @@ cdef object _drive_coro(object coro, object initial_fut, object loop):
 
 cdef inline object _step_coroutine_sync(object coro):
     """
-    Tier-1 Eager Fast Path + Tier-2 Event Loop Fallback for synchronous callers (RawTestClient):
-    1. Steps `coro.send(None)` eagerly with zero Task allocation.
-    2. If StopIteration is raised (no blocking I/O), returns `stop.value` in ~80ns.
-    3. If a Future/awaitable is yielded, drives `_drive_coro` on the shared uvloop/asyncio event loop until completion.
+    Tier-1 Eager Fast Path via PyIter_Send + Tier-2 Event Loop Fallback for synchronous callers (RawTestClient):
+    1. Steps `PyIter_Send(coro, None, &res_ptr)` eagerly with zero StopIteration exception allocation.
+    2. If PYGEN_RETURN (eager completion), returns value directly in ~15-20ns.
+    3. If PYGEN_NEXT (suspended on real I/O), drives `_drive_coro` on uvloop/asyncio until completion.
     """
+    cdef PyObject *res_ptr = NULL
     cdef object loop = _get_or_create_async_loop()
     cdef object prev_loop = events._get_running_loop()
     if prev_loop is None:
         events._set_running_loop(loop)
-    cdef object first_yielded
+    cdef PySendResult send_rc
     try:
-        first_yielded = coro.send(None)
+        send_rc = PyIter_Send(coro, None, &res_ptr)
     except StopIteration as stop:
         coro.close()
         return stop.value
@@ -195,7 +203,18 @@ cdef inline object _step_coroutine_sync(object coro):
         if prev_loop is None:
             events._set_running_loop(None)
 
-    # Coroutine yielded an incomplete Future/Awaitable! Escalate to Tier-2 Loop Driver:
+    cdef object val
+    if send_rc == PYGEN_RETURN:
+        val = <object>res_ptr
+        Py_DECREF_ptr(res_ptr)
+        coro.close()
+        return val
+    elif send_rc == PYGEN_ERROR:
+        coro.close()
+        raise
+
+    cdef object first_yielded = <object>res_ptr
+    Py_DECREF_ptr(res_ptr)
     cdef object completion_fut = _drive_coro(coro, first_yielded, loop)
     try:
         return loop.run_until_complete(completion_fut)
@@ -206,13 +225,15 @@ async def _step_coroutine_async(object coro, object loop):
     """
     Asynchronous coroutine driver for execution contexts inside an already-running event loop.
     Avoids calling loop.run_until_complete() reentrantly when loop.is_running() is True.
+    Uses PyIter_Send for zero-allocation eager stepping.
     """
     cdef object prev_loop = events._get_running_loop()
     if prev_loop is None:
         events._set_running_loop(loop)
-    cdef object first_yielded
+    cdef PyObject *res_ptr = NULL
+    cdef PySendResult send_rc
     try:
-        first_yielded = coro.send(None)
+        send_rc = PyIter_Send(coro, None, &res_ptr)
     except StopIteration as stop:
         coro.close()
         return stop.value
@@ -223,6 +244,18 @@ async def _step_coroutine_async(object coro, object loop):
         if prev_loop is None:
             events._set_running_loop(None)
 
+    cdef object val
+    if send_rc == PYGEN_RETURN:
+        val = <object>res_ptr
+        Py_DECREF_ptr(res_ptr)
+        coro.close()
+        return val
+    elif send_rc == PYGEN_ERROR:
+        coro.close()
+        raise
+
+    cdef object first_yielded = <object>res_ptr
+    Py_DECREF_ptr(res_ptr)
     cdef object completion_fut = _drive_coro(coro, first_yielded, loop)
     try:
         return await completion_fut
@@ -241,6 +274,58 @@ cdef int _cython_async_loop_tick() noexcept with gil:
         pass
     return _PENDING_ASYNC_TASKS
 
+cdef void _complete_suspended_coro(
+    uintptr_t client_addr,
+    RouteEntry entry,
+    object result,
+    int status_code,
+    bint is_error
+):
+    cdef char body_buf[32768]
+    cdef size_t body_len = 0
+    cdef char extra_hdrs[2048]
+    cdef size_t extra_hdrs_len = 0
+    cdef char *raw_ptr = NULL
+    cdef Py_ssize_t raw_len = 0
+    cdef object spec_attr
+
+    if is_error:
+        memcpy(body_buf, b"Internal Server Error", 21)
+        body_len = 21
+    elif isinstance(result, HTTPException):
+        status_code = result.status_code
+        _serialize_http_exception(result.detail, body_buf, &body_len)
+    else:
+        if entry.response_schema_spec is not None:
+            _serialize_schema_to_c_buf(result, entry.response_schema_spec, body_buf, &body_len)
+        elif isinstance(result, dict):
+            _serialize_dict_to_c_buf(<dict>result, body_buf, &body_len)
+        elif isinstance(result, bytes):
+            PyBytes_AsStringAndSize(result, &raw_ptr, &raw_len)
+            if <size_t>raw_len > 32768:
+                raw_len = 32768
+            memcpy(body_buf, raw_ptr, <size_t>raw_len)
+            body_len = <size_t>raw_len
+        elif isinstance(result, str):
+            raw_ptr = <char *>PyUnicode_AsUTF8AndSize(result, &raw_len)
+            if raw_ptr != NULL:
+                if <size_t>raw_len > 32768:
+                    raw_len = 32768
+                memcpy(body_buf, raw_ptr, <size_t>raw_len)
+                body_len = <size_t>raw_len
+        else:
+            spec_attr = getattr(result, "__bt_schema_spec__", None)
+            if spec_attr is not None:
+                _serialize_schema_to_c_buf(result, <CompiledSchemaSpec>spec_attr, body_buf, &body_len)
+            else:
+                memcpy(body_buf, b"Internal Server Error", 21)
+                body_len = 21
+                status_code = 500
+
+    bt_uv_complete_async_request(
+        <void *>client_addr, body_buf, body_len, extra_hdrs, extra_hdrs_len, status_code
+    )
+
 cdef void _schedule_suspended_tcp_coro(
     object coro,
     object first_yielded,
@@ -256,44 +341,20 @@ cdef void _schedule_suspended_tcp_coro(
 
     async def _drive_and_flush():
         global _PENDING_ASYNC_TASKS
-        cdef char body_buf[32768]
-        cdef size_t body_len = 0
-        cdef char extra_hdrs[2048]
-        cdef size_t extra_hdrs_len = 0
         cdef int status_code = entry.default_status_code
-        cdef char *raw_ptr = NULL
-        cdef Py_ssize_t raw_len = 0
         cdef BackgroundTasks bg_runner
-        cdef object result = None, enc = None, completion_fut = None
+        cdef object result = None, completion_fut = None
+        cdef bint is_error = False
 
         try:
             completion_fut = _drive_coro(coro, first_yielded, loop)
             result = await completion_fut
-
-            if entry.response_schema_spec is not None:
-                _serialize_schema_to_c_buf(result, entry.response_schema_spec, body_buf, &body_len)
-            elif hasattr(result, "__bt_schema_spec__"):
-                _serialize_schema_to_c_buf(
-                    result, <CompiledSchemaSpec>(result.__bt_schema_spec__), body_buf, &body_len
-                )
-            elif isinstance(result, dict):
-                _serialize_dict_to_c_buf(<dict>result, body_buf, &body_len)
-            elif isinstance(result, bytes):
-                PyBytes_AsStringAndSize(result, &raw_ptr, &raw_len)
-                memcpy(body_buf, raw_ptr, <size_t>raw_len)
-                body_len = <size_t>raw_len
-            elif isinstance(result, str):
-                enc = (<str>result).encode("utf-8")
-                PyBytes_AsStringAndSize(enc, &raw_ptr, &raw_len)
-                memcpy(body_buf, raw_ptr, <size_t>raw_len)
-                body_len = <size_t>raw_len
         except HTTPException as http_exc:
+            result = http_exc
             status_code = <int>http_exc.status_code
-            _serialize_dict_to_c_buf({"detail": http_exc.detail}, body_buf, &body_len)
         except Exception:
             status_code = 500
-            memcpy(body_buf, b"Internal Server Error", 21)
-            body_len = 21
+            is_error = True
         finally:
             coro.close()
             if teardown_stack is not None and len(teardown_stack) > 0:
@@ -302,9 +363,7 @@ cdef void _schedule_suspended_tcp_coro(
                 for bg_runner in bg_tasks_list:
                     await bg_runner._execute_all_async(loop)
             _PENDING_ASYNC_TASKS -= 1
-            bt_uv_complete_async_request(
-                <void *>client_addr, body_buf, body_len, extra_hdrs, extra_hdrs_len, status_code
-            )
+            _complete_suspended_coro(client_addr, entry, result, status_code, is_error)
 
     loop.create_task(_drive_and_flush())
 
@@ -356,22 +415,18 @@ cdef class Request:
         return PyBytes_FromStringAndSize(self._body, <Py_ssize_t>self._body_len)
 
     cpdef object get_header(self, str name):
-        cdef bytes b_name = name.encode("ascii")
-        cdef char *k_ptr = NULL
         cdef Py_ssize_t k_len = 0
+        cdef const char *k_ptr = PyUnicode_AsUTF8AndSize(name, &k_len)
         cdef bt_slice_t val
-        PyBytes_AsStringAndSize(b_name, &k_ptr, &k_len)
-        if bt_find_header(self._headers, self._num_headers, k_ptr, <size_t>k_len, &val):
+        if k_ptr != NULL and bt_find_header(self._headers, self._num_headers, k_ptr, <size_t>k_len, &val):
             return PyUnicode_DecodeUTF8(val.ptr, <Py_ssize_t>val.len, "replace")
         return None
 
     cpdef object get_query(self, str name):
-        cdef bytes b_name = name.encode("utf-8")
-        cdef char *k_ptr = NULL
         cdef Py_ssize_t k_len = 0
+        cdef const char *k_ptr = PyUnicode_AsUTF8AndSize(name, &k_len)
         cdef bt_slice_t val
-        PyBytes_AsStringAndSize(b_name, &k_ptr, &k_len)
-        if bt_find_query_param(self._query, self._query_len, k_ptr, <size_t>k_len, &val):
+        if k_ptr != NULL and bt_find_query_param(self._query, self._query_len, k_ptr, <size_t>k_len, &val):
             return PyUnicode_DecodeUTF8(val.ptr, <Py_ssize_t>val.len, "replace")
         return None
 
@@ -433,6 +488,8 @@ cdef class WebSocket:
     cdef public str accept_key
     cdef public list _in_frames
     cdef public list _out_frames
+    cdef size_t _in_idx
+    cdef size_t _out_idx
     cdef public dict _pubsub_registry_ref
 
     def __cinit__(self, str path="", dict pubsub_registry=None):
@@ -442,16 +499,16 @@ cdef class WebSocket:
         self.accept_key = ""
         self._in_frames = []
         self._out_frames = []
+        self._in_idx = 0
+        self._out_idx = 0
         self._pubsub_registry_ref = pubsub_registry
 
     cpdef str compute_handshake(self, str sec_websocket_key):
-        cdef bytes b_key = sec_websocket_key.encode("ascii")
-        cdef char *k_ptr = NULL
         cdef Py_ssize_t k_len = 0
+        cdef const char *k_ptr = PyUnicode_AsUTF8AndSize(sec_websocket_key, &k_len)
         cdef char out_accept[64]
         cdef size_t out_len = 0
-        PyBytes_AsStringAndSize(b_key, &k_ptr, &k_len)
-        if bt_ws_compute_accept(k_ptr, <size_t>k_len, out_accept, sizeof(out_accept), &out_len) != 0:
+        if k_ptr == NULL or bt_ws_compute_accept(k_ptr, <size_t>k_len, out_accept, sizeof(out_accept), &out_len) != 0:
             raise ValueError("Invalid Sec-WebSocket-Key")
         self.accept_key = PyUnicode_DecodeUTF8(out_accept, <Py_ssize_t>out_len, "strict")
         return self.accept_key
@@ -490,9 +547,14 @@ cdef class WebSocket:
         self._in_frames.append(text)
 
     async def receive_text(self) -> str:
-        if not self._in_frames:
+        if self._in_idx >= len(self._in_frames):
             raise RuntimeError("No WebSocket frame available")
-        return self._in_frames.pop(0)
+        cdef str msg = self._in_frames[self._in_idx]
+        self._in_idx += 1
+        if self._in_idx == len(self._in_frames) and self._in_idx > 64:
+            self._in_frames.clear()
+            self._in_idx = 0
+        return msg
 
     cpdef bytes _encode_server_frame(self, str text):
         cdef Py_ssize_t s_len = 0
@@ -510,9 +572,13 @@ cdef class WebSocket:
         self._out_frames.append(encoded_frame)
 
     cpdef str pop_outgoing_text(self):
-        if not self._out_frames:
+        if self._out_idx >= len(self._out_frames):
             raise RuntimeError("No outgoing WebSocket frame")
-        cdef bytes raw = self._out_frames.pop(0)
+        cdef bytes raw = self._out_frames[self._out_idx]
+        self._out_idx += 1
+        if self._out_idx == len(self._out_frames) and self._out_idx > 64:
+            self._out_frames.clear()
+            self._out_idx = 0
         cdef char stack_buf[4096]
         cdef char *buf_ptr = NULL
         cdef Py_ssize_t raw_len = 0
@@ -582,38 +648,30 @@ cdef class BackgroundTasks:
         self._tasks = []
 
     def add_task(self, object func, *args, **kwargs):
-        cdef bint is_coro = inspect.iscoroutinefunction(func)
-        self._tasks.append((func, args, kwargs, is_coro))
+        cdef bint has_kwargs = bool(kwargs)
+        self._tasks.append((func, args, kwargs if has_kwargs else None))
 
     cpdef void _execute_all(self):
         cdef tuple task_entry
-        cdef object fn, args, kwargs, coro
-        cdef bint is_coro
+        cdef object fn, args, kwargs, res
         for task_entry in self._tasks:
             fn = task_entry[0]
             args = task_entry[1]
             kwargs = task_entry[2]
-            is_coro = <bint>(task_entry[3])
-            if is_coro:
-                coro = fn(*args, **kwargs)
-                _step_coroutine_sync(coro)
-            else:
-                fn(*args, **kwargs)
+            res = fn(*args) if kwargs is None else fn(*args, **kwargs)
+            if PyCoro_CheckExact(res) or inspect.iscoroutine(res):
+                _step_coroutine_sync(res)
 
     async def _execute_all_async(self, object loop):
         cdef tuple task_entry
-        cdef object fn, args, kwargs, coro
-        cdef bint is_coro
+        cdef object fn, args, kwargs, res
         for task_entry in self._tasks:
             fn = task_entry[0]
             args = task_entry[1]
             kwargs = task_entry[2]
-            is_coro = <bint>(task_entry[3])
-            if is_coro:
-                coro = fn(*args, **kwargs)
-                await _step_coroutine_async(coro, loop)
-            else:
-                fn(*args, **kwargs)
+            res = fn(*args) if kwargs is None else fn(*args, **kwargs)
+            if PyCoro_CheckExact(res) or inspect.iscoroutine(res):
+                await _step_coroutine_async(res, loop)
 
 
 cdef class CompiledSecuritySpec:
@@ -732,7 +790,9 @@ cdef class CompiledFieldSpec:
         object min_length=None,
         object max_length=None,
     ):
-        self.name = name
+        cdef PyObject *o_name = <PyObject *>name
+        PyUnicode_InternInPlace(&o_name)
+        self.name = <str>o_name
         self.b_name = name.encode("utf-8")
         cdef char *ptr = NULL
         cdef Py_ssize_t length = 0
@@ -839,7 +899,9 @@ cdef class CompiledParamSpec:
         int dep_slot_index=-1,
         CompiledSecuritySpec security_spec=None,
     ):
-        self.arg_name = arg_name
+        cdef PyObject *o_arg = <PyObject *>arg_name
+        PyUnicode_InternInPlace(&o_arg)
+        self.arg_name = <str>o_arg
         self.lookup_key = lookup_name.encode("utf-8")
         cdef char *ptr = NULL
         cdef Py_ssize_t length = 0
@@ -905,12 +967,22 @@ cdef class CompiledDepStep:
 cdef class MiddlewareResponse:
     cdef public int status_code
     cdef public bytes body
-    cdef public dict headers
+    cdef dict _headers
 
     def __cinit__(self, int status_code=200, bytes body=b"", dict headers=None):
         self.status_code = status_code
         self.body = body
-        self.headers = headers if headers is not None else {}
+        self._headers = headers
+
+    @property
+    def headers(self) -> dict:
+        if self._headers is None:
+            self._headers = {}
+        return self._headers
+
+    @headers.setter
+    def headers(self, dict val):
+        self._headers = val
 
 
 cdef class RouteEntry:
@@ -923,6 +995,7 @@ cdef class RouteEntry:
     cdef public CompiledSchemaSpec response_schema_spec
     cdef public int default_status_code
     cdef public list user_middlewares
+    cdef public bint has_bg_tasks
 
     def __cinit__(
         self,
@@ -943,6 +1016,21 @@ cdef class RouteEntry:
         self.response_schema_spec = response_schema_spec
         self.default_status_code = default_status_code
         self.user_middlewares = user_middlewares
+
+        self.has_bg_tasks = False
+        cdef CompiledParamSpec p_spec
+        for p in param_specs:
+            if (<CompiledParamSpec>p).source == SRC_BACKGROUND_TASKS:
+                self.has_bg_tasks = True
+                break
+        if not self.has_bg_tasks and dep_steps is not None:
+            for step in dep_steps:
+                for p in (<CompiledDepStep>step).param_specs:
+                    if (<CompiledParamSpec>p).source == SRC_BACKGROUND_TASKS:
+                        self.has_bg_tasks = True
+                        break
+                if self.has_bg_tasks:
+                    break
 
 
 cdef inline void _write_422_error(
@@ -971,27 +1059,60 @@ cdef inline void _write_422_error(
     out_status_code[0] = 422
 
 
-cdef list _parse_yyjson_array(yyjson_val *arr_val):
-    cdef size_t n = yyjson_get_len(arr_val)
-    cdef list res = []
-    cdef yyjson_val *elem
-    cdef size_t i
-    if n == 0:
+cdef object _yyjson_val_to_py(yyjson_val *val):
+    if val == NULL or yyjson_is_null(val):
+        return None
+    elif yyjson_is_bool(val):
+        return bool(yyjson_get_bool(val))
+    elif yyjson_is_int(val):
+        return yyjson_get_sint(val)
+    elif yyjson_is_num(val):
+        return yyjson_get_num(val)
+    elif yyjson_is_str(val):
+        return PyUnicode_DecodeUTF8(yyjson_get_str(val), <Py_ssize_t>yyjson_get_len(val), "strict")
+    elif yyjson_is_arr(val):
+        return _yyjson_arr_to_list(val)
+    elif yyjson_is_obj(val):
+        return _yyjson_obj_to_dict(val)
+    return None
+
+cdef dict _yyjson_obj_to_dict(yyjson_val *obj):
+    cdef dict res = {}
+    if obj == NULL:
         return res
-    elem = yyjson_arr_get_first(arr_val)
-    for i in range(n):
-        if yyjson_is_str(elem):
-            res.append(PyUnicode_DecodeUTF8(yyjson_get_str(elem), <Py_ssize_t>yyjson_get_len(elem), "strict"))
-        elif yyjson_is_int(elem):
-            res.append(yyjson_get_sint(elem))
-        elif yyjson_is_num(elem):
-            res.append(yyjson_get_num(elem))
-        elif yyjson_is_bool(elem):
-            res.append(bool(yyjson_get_bool(elem)))
-        elif yyjson_is_null(elem):
-            res.append(None)
-        elem += 1
+    cdef yyjson_obj_iter iter
+    if not yyjson_obj_iter_init(obj, &iter):
+        return res
+    cdef yyjson_val *key
+    cdef yyjson_val *val
+    cdef object py_key, py_val
+    while True:
+        key = yyjson_obj_iter_next(&iter)
+        if key == NULL:
+            break
+        val = yyjson_obj_iter_get_val(key)
+        py_key = PyUnicode_DecodeUTF8(yyjson_get_str(key), <Py_ssize_t>yyjson_get_len(key), "strict")
+        py_val = _yyjson_val_to_py(val)
+        res[py_key] = py_val
     return res
+
+cdef list _yyjson_arr_to_list(yyjson_val *arr):
+    cdef list res = []
+    if arr == NULL:
+        return res
+    cdef yyjson_arr_iter iter
+    if not yyjson_arr_iter_init(arr, &iter):
+        return res
+    cdef yyjson_val *elem
+    while True:
+        elem = yyjson_arr_iter_next(&iter)
+        if elem == NULL:
+            break
+        res.append(_yyjson_val_to_py(elem))
+    return res
+
+cdef list _parse_yyjson_array(yyjson_val *arr_val):
+    return _yyjson_arr_to_list(arr_val)
 
 
 cdef object _deserialize_schema_from_c_json(
@@ -1100,6 +1221,46 @@ cdef object _deserialize_schema_from_c_json(
     return instance
 
 
+cdef yyjson_mut_val *_py_val_to_yyjson_mut(yyjson_mut_doc *doc, object val):
+    cdef const char *s_ptr = NULL
+    cdef Py_ssize_t s_len = 0
+    cdef yyjson_mut_val *arr_node
+    cdef yyjson_mut_val *obj_node
+    cdef yyjson_mut_val *k_node
+    cdef yyjson_mut_val *v_node
+    cdef object item, k, v
+
+    if val is None:
+        return yyjson_mut_null(doc)
+    elif isinstance(val, bool):
+        return yyjson_mut_bool(doc, 1 if val else 0)
+    elif isinstance(val, int):
+        return yyjson_mut_sint(doc, <int64_t>val)
+    elif isinstance(val, float):
+        return yyjson_mut_real(doc, <double>val)
+    elif isinstance(val, str):
+        s_ptr = PyUnicode_AsUTF8AndSize(val, &s_len)
+        return yyjson_mut_strn(doc, s_ptr, <size_t>s_len)
+    elif isinstance(val, list):
+        arr_node = yyjson_mut_arr(doc)
+        for item in (<list>val):
+            v_node = _py_val_to_yyjson_mut(doc, item)
+            if v_node != NULL:
+                yyjson_mut_arr_append(arr_node, v_node)
+        return arr_node
+    elif isinstance(val, dict):
+        obj_node = yyjson_mut_obj(doc)
+        for k, v in (<dict>val).items():
+            if isinstance(k, str):
+                s_ptr = PyUnicode_AsUTF8AndSize(k, &s_len)
+                k_node = yyjson_mut_strn(doc, s_ptr, <size_t>s_len)
+                v_node = _py_val_to_yyjson_mut(doc, v)
+                if v_node != NULL:
+                    yyjson_mut_obj_add(obj_node, k_node, v_node)
+        return obj_node
+    return yyjson_mut_null(doc)
+
+
 cdef inline void _write_py_value_to_yyjson(
     bt_json_writer_t *w,
     const char *key_ptr,
@@ -1109,8 +1270,7 @@ cdef inline void _write_py_value_to_yyjson(
     cdef const char *s_ptr = NULL
     cdef Py_ssize_t s_len = 0
     cdef yyjson_mut_val *k_node
-    cdef yyjson_mut_val *arr_node
-    cdef object item
+    cdef yyjson_mut_val *v_node
 
     if val is None:
         bt_json_writer_add_null(w, key_ptr, key_len)
@@ -1123,22 +1283,12 @@ cdef inline void _write_py_value_to_yyjson(
     elif isinstance(val, str):
         s_ptr = PyUnicode_AsUTF8AndSize(val, &s_len)
         bt_json_writer_add_str(w, key_ptr, key_len, s_ptr, <size_t>s_len)
-    elif isinstance(val, list):
+    else:
         k_node = yyjson_mut_strn(w.doc, key_ptr, key_len)
-        arr_node = yyjson_mut_arr(w.doc)
-        for item in (<list>val):
-            if isinstance(item, str):
-                s_ptr = PyUnicode_AsUTF8AndSize(item, &s_len)
-                yyjson_mut_arr_append(arr_node, yyjson_mut_strn(w.doc, s_ptr, <size_t>s_len))
-            elif isinstance(item, bool):
-                yyjson_mut_arr_append(arr_node, yyjson_mut_bool(w.doc, 1 if item else 0))
-            elif isinstance(item, int):
-                yyjson_mut_arr_append(arr_node, yyjson_mut_sint(w.doc, <int64_t>item))
-            elif isinstance(item, float):
-                yyjson_mut_arr_append(arr_node, yyjson_mut_real(w.doc, <double>item))
-            elif item is None:
-                yyjson_mut_arr_append(arr_node, yyjson_mut_null(w.doc))
-        yyjson_mut_obj_add(w.root, k_node, arr_node)
+        v_node = _py_val_to_yyjson_mut(w.doc, val)
+        if v_node != NULL:
+            yyjson_mut_obj_add(w.root, k_node, v_node)
+
 
 
 cdef int _serialize_schema_to_c_buf(
@@ -1188,6 +1338,18 @@ cdef int _serialize_dict_to_c_buf(
     return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
 
 
+cdef int _serialize_http_exception(
+    object detail,
+    char *out_body_buf,
+    size_t *out_body_len
+):
+    cdef bt_json_writer_t writer
+    if bt_json_writer_init(&writer) != 0:
+        return -1
+    _write_py_value_to_yyjson(&writer, "detail", 6, detail)
+    return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
+
+
 cdef inline void _write_auth_error(
     int status_code,
     char *out_body_buf,
@@ -1234,7 +1396,7 @@ cdef object _execute_c_security_spec(
         if res != BT_SEC_OK:
             _write_auth_error(<int>res, out_body_buf, out_body_len, out_status_code)
             return None
-        return _py_json.loads(PyBytes_FromStringAndSize(decode_buf, <Py_ssize_t>payload_len))
+        return _yyjson_obj_to_dict(jdoc.root)
 
     elif sec.sec_kind == SEC_KIND_APIKEY_HDR or sec.sec_kind == SEC_KIND_APIKEY_QUERY:
         res = bt_verify_api_key(
@@ -1505,7 +1667,7 @@ cdef int _execute_route_inner(
     char *out_body_buf, size_t *out_body_len,
     char *out_extra_hdrs, size_t *out_extra_hdrs_len,
     int *out_status_code
-) except -1:
+) except? -1:
     cdef object result = None
     cdef object coro_obj = None
     cdef object first_yielded = None
@@ -1523,8 +1685,11 @@ cdef int _execute_route_inner(
     cdef object dep_obj
     cdef object anext_coro
     cdef object body_bytes_res, hdr_bytes_res, status_res
-    cdef list bg_tasks_list = []
+    cdef list bg_tasks_list = [] if entry.has_bg_tasks else None
     cdef BackgroundTasks bg_runner
+    cdef object spec_attr = None
+    cdef PySendResult send_rc
+    cdef PyObject *res_ptr = NULL
 
     try:
         if entry.num_dep_steps > 0:
@@ -1600,16 +1765,29 @@ cdef int _execute_route_inner(
             prev_loop = events._get_running_loop()
             if prev_loop is None:
                 events._set_running_loop(loop)
+            res_ptr = NULL
             try:
-                try:
-                    first_yielded = coro_obj.send(None)
-                except StopIteration as stop:
-                    result = stop.value
-                    coro_obj.close()
-                    coro_obj = None
+                send_rc = PyIter_Send(coro_obj, None, &res_ptr)
+            except StopIteration as stop:
+                result = stop.value
+                coro_obj.close()
+                coro_obj = None
             finally:
                 if prev_loop is None:
                     events._set_running_loop(None)
+            if coro_obj is not None:
+                if send_rc == PYGEN_RETURN:
+                    result = <object>res_ptr
+                    Py_DECREF_ptr(res_ptr)
+                    coro_obj.close()
+                    coro_obj = None
+                elif send_rc == PYGEN_ERROR:
+                    coro_obj.close()
+                    coro_obj = None
+                    raise
+                elif send_rc == PYGEN_NEXT:
+                    first_yielded = <object>res_ptr
+                    Py_DECREF_ptr(res_ptr)
 
             if coro_obj is not None:
                 if async_client_ctx != NULL:
@@ -1629,48 +1807,65 @@ cdef int _execute_route_inner(
 
         out_status_code[0] = entry.default_status_code
 
-        # Support EventSourceResponse (SSE) and FileResponse objects
-        if hasattr(result, "__bt_custom_response__"):
+        # 1. Route has pre-compiled Schema spec (Fast Path)
+        if entry.response_schema_spec is not None:
+            return _serialize_schema_to_c_buf(result, entry.response_schema_spec, out_body_buf, out_body_len)
+
+        # 2. Python dictionary (most common fast response)
+        if isinstance(result, dict):
+            return _serialize_dict_to_c_buf(<dict>result, out_body_buf, out_body_len)
+
+        # 3. Raw bytes with 32KB buffer overflow guard
+        if isinstance(result, bytes):
+            PyBytes_AsStringAndSize(result, &raw_bytes_ptr, &raw_bytes_len)
+            if <size_t>raw_bytes_len > 32768:
+                out_status_code[0] = 500
+                return -1
+            memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
+            out_body_len[0] = <size_t>raw_bytes_len
+            return 0
+
+        # 4. Raw string with zero-copy UTF-8 pointer extraction and 32KB guard
+        if isinstance(result, str):
+            raw_bytes_ptr = <char *>PyUnicode_AsUTF8AndSize(result, &raw_bytes_len)
+            if raw_bytes_ptr == NULL or <size_t>raw_bytes_len > 32768:
+                out_status_code[0] = 500
+                return -1
+            memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
+            out_body_len[0] = <size_t>raw_bytes_len
+            return 0
+
+        # 5. Schema instance without route-level spec
+        spec_attr = getattr(result, "__bt_schema_spec__", None)
+        if spec_attr is not None:
+            return _serialize_schema_to_c_buf(
+                result, <CompiledSchemaSpec>spec_attr, out_body_buf, out_body_len
+            )
+
+        # 6. Custom response (FileResponse, HTMLResponse, SSE)
+        if getattr(result, "__bt_custom_response__", False):
             body_bytes_res, hdr_bytes_res, status_res = result._render_c_response()
             out_status_code[0] = <int>status_res
             PyBytes_AsStringAndSize(body_bytes_res, &raw_bytes_ptr, &raw_bytes_len)
+            if <size_t>raw_bytes_len > 32768:
+                out_status_code[0] = 500
+                return -1
             memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
             out_body_len[0] = <size_t>raw_bytes_len
 
             if hdr_bytes_res:
                 PyBytes_AsStringAndSize(hdr_bytes_res, &raw_bytes_ptr, &raw_bytes_len)
+                if <size_t>raw_bytes_len > 2048:
+                    raw_bytes_len = 2048
                 memcpy(out_extra_hdrs, raw_bytes_ptr, <size_t>raw_bytes_len)
                 out_extra_hdrs_len[0] = <size_t>raw_bytes_len
             return 0
 
-        if entry.response_schema_spec is not None:
-            return _serialize_schema_to_c_buf(result, entry.response_schema_spec, out_body_buf, out_body_len)
-
-        if hasattr(result, "__bt_schema_spec__"):
-            return _serialize_schema_to_c_buf(
-                result, <CompiledSchemaSpec>(result.__bt_schema_spec__), out_body_buf, out_body_len
-            )
-
-        if isinstance(result, dict):
-            return _serialize_dict_to_c_buf(<dict>result, out_body_buf, out_body_len)
-
-        if isinstance(result, bytes):
-            PyBytes_AsStringAndSize(result, &raw_bytes_ptr, &raw_bytes_len)
-            memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
-            out_body_len[0] = <size_t>raw_bytes_len
-            return 0
-        elif isinstance(result, str):
-            encoded = (<str>result).encode("utf-8")
-            PyBytes_AsStringAndSize(encoded, &raw_bytes_ptr, &raw_bytes_len)
-            memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
-            out_body_len[0] = <size_t>raw_bytes_len
-            return 0
-        else:
-            return -1
+        return -1
 
     except HTTPException as http_exc:
         out_status_code[0] = <int>http_exc.status_code
-        return _serialize_dict_to_c_buf({"detail": http_exc.detail}, out_body_buf, out_body_len)
+        return _serialize_http_exception(http_exc.detail, out_body_buf, out_body_len)
     except Exception:
         return -1
     finally:
@@ -1681,6 +1876,7 @@ cdef int _execute_route_inner(
                 bg_runner._execute_all()
 
 
+@cython.freelist(1024)
 cdef class _RouteInvocationContext:
     cdef RouteEntry entry
     cdef const char *method
@@ -1798,9 +1994,9 @@ cdef int _cython_invoke_handler(
                 memcpy(out_body_buf, <const char *>b_out, <size_t>len(b_out))
                 out_body_len[0] = <size_t>len(b_out)
 
-            if (<MiddlewareResponse>mw_res).headers:
+            if (<MiddlewareResponse>mw_res)._headers:
                 safe_lines = []
-                for k, v in (<MiddlewareResponse>mw_res).headers.items():
+                for k, v in (<MiddlewareResponse>mw_res)._headers.items():
                     clean_k = str(k).replace("\r", "").replace("\n", "").replace("\0", "")
                     clean_v = str(v).replace("\r", "").replace("\n", "").replace("\0", "")
                     safe_lines.append(f"{clean_k}: {clean_v}\r\n")
@@ -1818,6 +2014,19 @@ cdef int _cython_invoke_handler(
         return 0
     except Exception:
         return -1
+
+
+cdef inline void _copy_sanitized_log_str(char *dst, size_t dst_cap, const char *src, size_t src_len) noexcept nogil:
+    cdef size_t n = src_len if src_len < dst_cap - 1 else dst_cap - 1
+    cdef size_t i
+    cdef char c
+    for i in range(n):
+        c = src[i]
+        if c == b'"' or c == b'\\' or c == b'\n' or c == b'\r':
+            dst[i] = b'_'
+        else:
+            dst[i] = c
+    dst[n] = b'\0'
 
 
 cdef class CythonRingLogger:
@@ -1852,7 +2061,6 @@ cdef class CythonRingLogger:
         cdef Py_ssize_t k_len = 0
         cdef const char *s_ptr = NULL
         cdef Py_ssize_t s_len = 0
-        cdef size_t copy_klen, copy_slen
         cdef bt_log_kv_t *kv
 
         if kwargs is not None and len(kwargs) > 0:
@@ -1861,12 +2069,10 @@ cdef class CythonRingLogger:
                     break
                 if not isinstance(k, str):
                     continue
-                clean_k = k.replace('"', '_').replace('\\', '_').replace('\n', '_').replace('\r', '_')
-                k_ptr = PyUnicode_AsUTF8AndSize(clean_k, &k_len)
+                k_ptr = PyUnicode_AsUTF8AndSize(k, &k_len)
                 kv = &slot.kvs[kv_idx]
-                copy_klen = <size_t>k_len if k_len < 23 else 23
-                memcpy(kv.key, k_ptr, copy_klen)
-                kv.key_len = <uint8_t>copy_klen
+                _copy_sanitized_log_str(kv.key, sizeof(kv.key), k_ptr, <size_t>k_len)
+                kv.key_len = <uint8_t>(k_len if k_len < 23 else 23)
 
                 if isinstance(v, bool):
                     kv.val_type = BT_LOG_VAL_BOOL
@@ -1881,12 +2087,10 @@ cdef class CythonRingLogger:
                     kv.v.f_val = <double>v
                     kv_idx += 1
                 elif isinstance(v, str):
-                    clean_v = v.replace('"', '_').replace('\\', '_').replace('\n', '_').replace('\r', '_')
                     kv.val_type = BT_LOG_VAL_STR
-                    s_ptr = PyUnicode_AsUTF8AndSize(clean_v, &s_len)
-                    copy_slen = <size_t>s_len if s_len < 47 else 47
-                    memcpy(kv.v.s_val, s_ptr, copy_slen)
-                    kv.str_len = <uint8_t>copy_slen
+                    s_ptr = PyUnicode_AsUTF8AndSize(v, &s_len)
+                    _copy_sanitized_log_str(kv.v.s_val, sizeof(kv.v.s_val), s_ptr, <size_t>s_len)
+                    kv.str_len = <uint8_t>(s_len if s_len < 47 else 47)
                     kv_idx += 1
 
         slot.num_kvs = kv_idx
@@ -2031,6 +2235,7 @@ cdef class CoreRouter:
         self._user_middlewares.append(fn)
 
 
+@cython.freelist(4096)
 cdef class RawResponse:
     cdef readonly int status_code
     cdef readonly bytes body

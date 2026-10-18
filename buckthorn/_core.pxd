@@ -20,6 +20,15 @@ cdef extern from "c_vendor/yyjson.h" nogil:
         pass
     ctypedef struct yyjson_obj_iter:
         pass
+    ctypedef struct yyjson_arr_iter:
+        pass
+
+    bint yyjson_obj_iter_init(const yyjson_val *obj, yyjson_obj_iter *iter)
+    yyjson_val *yyjson_obj_iter_next(yyjson_obj_iter *iter)
+    yyjson_val *yyjson_obj_iter_get_val(yyjson_val *key)
+
+    bint yyjson_arr_iter_init(const yyjson_val *arr, yyjson_arr_iter *iter)
+    yyjson_val *yyjson_arr_iter_next(yyjson_arr_iter *iter)
 
     bint yyjson_is_null(yyjson_val *val)
     bint yyjson_is_bool(yyjson_val *val)
@@ -419,4 +428,16 @@ cdef extern from "c_src/bt_audit.h" nogil:
         size_t max_body_size
     )
     size_t bt_sanitize_header_str(const char *in_str, size_t in_len, char *out, size_t out_cap)
+
+from cpython.ref cimport PyObject
+
+cdef extern from "Python.h":
+    void PyUnicode_InternInPlace(PyObject **s)
+    ctypedef enum PySendResult:
+        PYGEN_RETURN = 0
+        PYGEN_ERROR = -1
+        PYGEN_NEXT = 1
+    PySendResult PyIter_Send(object iter, object arg, PyObject **presult) except? PYGEN_ERROR
+    void Py_DECREF_ptr "Py_DECREF" (PyObject *o)
+    bint PyCoro_CheckExact(object op)
 
