@@ -51,13 +51,26 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _load_target_app(target: str) -> Any:
     if ":" not in target:
         raise ValueError("Target must be formatted as 'module:app'")
-    mod_name, app_attr = target.split(":", 1)
+    target_path, app_attr = target.split(":", 1)
+    path_obj = Path(target_path)
+    if path_obj.is_file() or target_path.endswith(".py"):
+        resolved_path = path_obj.resolve()
+        sys.path.insert(0, str(resolved_path.parent))
+        mod_name = resolved_path.stem
+        spec = importlib.util.spec_from_file_location(mod_name, str(resolved_path))
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return getattr(mod, app_attr)
+
+    mod_name = target_path
     if mod_name.endswith(".py"):
         mod_name = mod_name[:-3]
     mod_name = mod_name.replace("/", ".").replace("\\", ".").strip(".")
     sys.path.insert(0, os.getcwd())
     mod = importlib.import_module(mod_name)
     return getattr(mod, app_attr)
+
 
 
 def build_command(args: argparse.Namespace) -> Path:
@@ -192,25 +205,33 @@ def bench_command(args: argparse.Namespace) -> None:
     print("|" + "-" * 37 + "|" + "-" * 14 + "|" + "-" * 17 + "|" + "-" * 11 + "|" + "-" * 11 + "|" + "-" * 11 + "|" + gate_sep)
 
     for method, path, req, endpoint in targets_to_run:
-        # Warmup
+        send_raw = client.send_raw
+
+        # 1. Warmup pass
         warmup_n = min(300, max(10, iterations // 10))
         for _ in range(warmup_n):
-            client.send_raw(req)
+            send_raw(req)
 
-        latencies_us: list[float] = []
+        # 2. De-biased Raw Throughput Pass (Zero measurement instrumentation in tight loop)
         t0 = time.perf_counter()
         for _ in range(iterations):
-            req_start = time.perf_counter_ns()
-            resp = client.send_raw(req)
-            req_end = time.perf_counter_ns()
-            latencies_us.append((req_end - req_start) / 1000.0)
+            send_raw(req)
         total_time = time.perf_counter() - t0
         rps = iterations / total_time
 
+        # 3. Latency Distribution Sampling Pass (Fixed sample size to avoid degrading throughput)
+        sample_n = min(iterations, 2000)
+        latencies_us: list[float] = []
+        for _ in range(sample_n):
+            req_start = time.perf_counter_ns()
+            send_raw(req)
+            req_end = time.perf_counter_ns()
+            latencies_us.append((req_end - req_start) / 1000.0)
+
         latencies_us.sort()
         avg_us = statistics.mean(latencies_us)
-        p50_us = latencies_us[int(iterations * 0.50)]
-        p99_us = latencies_us[int(iterations * 0.99)]
+        p50_us = latencies_us[int(sample_n * 0.50)]
+        p99_us = latencies_us[min(int(sample_n * 0.99), sample_n - 1)]
 
         htype = "C / STATIC"
         if endpoint is not None:
