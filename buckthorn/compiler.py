@@ -258,8 +258,18 @@ def transpile_module_to_pyx(source_code: str) -> str:
     Cython `.pyx` source string with `cdef class` Schemas and Coroutine Elision.
     """
     tree = ast.parse(source_code)
+    future_imports: list[str] = []
+    body_nodes: list[ast.stmt] = []
+
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            future_imports.append(ast.unparse(node))
+        else:
+            body_nodes.append(node)
+
     header = [
         "# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, initializedcheck=False, infer_types=True, binding=True, annotation_typing=False",
+        *future_imports,
         "cimport cython",
         "from buckthorn.schema import register_compiled_schema as _bt_register_compiled_schema",
         "",
@@ -267,7 +277,7 @@ def transpile_module_to_pyx(source_code: str) -> str:
 
     chunks: list[str] = list(header)
 
-    for node in tree.body:
+    for node in body_nodes:
         if isinstance(node, ast.ClassDef):
             base_names = [_extract_type_name(b) for b in node.bases]
             if "Schema" in base_names:
@@ -284,6 +294,7 @@ def transpile_module_to_pyx(source_code: str) -> str:
         chunks.append("")
 
     return "\n".join(chunks)
+
 
 
 def compile_pyx_module(

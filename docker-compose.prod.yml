@@ -1,0 +1,43 @@
+# docker-compose.prod.yml
+services:
+  buckthorn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUCKTHORN_PORTABLE_WHEEL: "0"
+    image: buckthorn-app:1.0.0
+    restart: unless-stopped
+    command: ["buckthorn", "run", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    sysctls:
+      # Match uv_listen(..., 4096, ...) in bt_http.c so bursts never drop SYN packets
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_tw_reuse: 1
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 1G
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      buckthorn:
+        condition: service_healthy
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    sysctls:
+      net.core.somaxconn: 4096
