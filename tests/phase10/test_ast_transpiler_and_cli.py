@@ -155,3 +155,25 @@ def test_buckthorn_cli_build_command_creates_compiled_extension(tmp_path):
     assert so_path.exists()
     assert so_path.suffix == ".so"
     assert (out_dir / "sample_service.pyx").exists()
+
+
+def test_cli_reloader_snapshot_and_diff(tmp_path):
+    from buckthorn.cli import _snapshot_project_mtimes, _diff_snapshots
+
+    code_file = tmp_path / "app.py"
+    code_file.write_text("app = 1", encoding="utf-8")
+
+    snap1 = _snapshot_project_mtimes(tmp_path)
+    assert str(code_file) in snap1
+
+    # No change
+    assert _diff_snapshots(snap1, snap1) is None
+
+    # Modify file
+    time.sleep(0.01)
+    code_file.write_text("app = 2", encoding="utf-8")
+    snap2 = _snapshot_project_mtimes(tmp_path)
+    changed = _diff_snapshots(snap1, snap2)
+    assert changed is not None
+    assert "app.py" in changed
+

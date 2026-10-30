@@ -1,4 +1,6 @@
 # buckthorn/openapi.py
+import html
+import json
 from typing import Any, Type
 from buckthorn._core import CompiledFieldSpec, CompiledParamSpec, CompiledSchemaSpec
 from buckthorn.schema import Schema, get_schema_spec
@@ -151,33 +153,37 @@ def build_openapi_schema(
 
 
 def get_swagger_ui_html(title: str, openapi_url: str = "/openapi.json") -> bytes:
-    html = f"""<!DOCTYPE html>
+    safe_title = html.escape(title, quote=True)
+    safe_url_js = json.dumps(openapi_url)
+    doc = f"""<!DOCTYPE html>
 <html>
 <head>
-  <title>{title} - Swagger UI</title>
+  <title>{safe_title} - Swagger UI</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
 </head>
 <body>
   <div id="swagger-ui"></div>
   <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
   <script>
-    SwaggerUIBundle({{ url: '{openapi_url}', dom_id: '#swagger-ui' }});
+    SwaggerUIBundle({{ url: {safe_url_js}, dom_id: '#swagger-ui' }});
   </script>
 </body>
 </html>"""
-    return html.encode("utf-8")
+    return doc.encode("utf-8")
 
 
 def get_scalar_ui_html(title: str, openapi_url: str = "/openapi.json") -> bytes:
-    html = f"""<!DOCTYPE html>
+    safe_title = html.escape(title, quote=True)
+    safe_url_attr = html.escape(openapi_url, quote=True)
+    doc = f"""<!DOCTYPE html>
 <html>
 <head>
-  <title>{title} - Scalar API Reference</title>
+  <title>{safe_title} - Scalar API Reference</title>
   <meta charset="utf-8" />
 </head>
 <body>
-  <script id="api-reference" data-url="{openapi_url}"></script>
+  <script id="api-reference" data-url="{safe_url_attr}"></script>
   <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
 </body>
 </html>"""
-    return html.encode("utf-8")
+    return doc.encode("utf-8")

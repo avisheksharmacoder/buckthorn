@@ -2,6 +2,7 @@
 import ast
 import importlib.util
 import platform
+import sysconfig
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -80,6 +81,33 @@ def _parse_field_constraints(value_node: ast.AST | None) -> dict[str, Any]:
     return info
 
 
+class _LocalAnnAssignLowerer(ast.NodeTransformer):
+    """Recursively lowers annotated local assignments inside function blocks into @cython.locals."""
+
+    def __init__(self, cython_locals: dict[str, str]):
+        self.cython_locals = cython_locals
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        return node  # Do not descend into nested function scopes
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST | None:
+        if isinstance(node.target, ast.Name):
+            tname = _extract_type_name(node.annotation)
+            if tname in _ANNOTATION_TO_CYTHON_LOCAL:
+                self.cython_locals[node.target.id] = _ANNOTATION_TO_CYTHON_LOCAL[tname]
+            if node.value is not None:
+                assign_stmt = ast.Assign(targets=[node.target], value=node.value)
+                return ast.copy_location(assign_stmt, node)
+            return None
+        return node
+
+
 def _lower_schema_class_to_pyx(cls_node: ast.ClassDef) -> str:
     cls_name = cls_node.name
     cdef_lines: list[str] = []
@@ -101,9 +129,15 @@ def _lower_schema_class_to_pyx(cls_node: ast.ClassDef) -> str:
                     f"            self.{fname} = kwargs['{fname}']"
                 )
             else:
-                init_lines.append(
-                    f"        self.{fname} = kwargs.get('{fname}', {fmeta['default']})"
-                )
+                def_expr = fmeta["default"]
+                if type_id == 6 and def_expr != "None":
+                    init_lines.append(
+                        f"        self.{fname} = list(kwargs['{fname}']) if '{fname}' in kwargs else list({def_expr})"
+                    )
+                else:
+                    init_lines.append(
+                        f"        self.{fname} = kwargs.get('{fname}', {def_expr})"
+                    )
 
             dump_entries.append(f"'{fname}': self.{fname}")
             spec_tuples.append(
@@ -134,11 +168,20 @@ def _lower_schema_class_to_pyx(cls_node: ast.ClassDef) -> str:
     return "\n".join(lines)
 
 
+def _is_sentinel_default(def_node: ast.AST | None) -> bool:
+    if def_node is None:
+        return False
+    if isinstance(def_node, ast.Call):
+        return True
+    if isinstance(def_node, ast.Constant) and def_node.value is None:
+        return True
+    return False
+
+
 def _lower_function_to_pyx(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
     is_async = isinstance(fn_node, ast.AsyncFunctionDef)
     can_elide_async = is_async and not _contains_async_construct(fn_node)
 
-    # Collect Cython local variable types from parameter and body annotations
     cython_locals: dict[str, str] = {}
     num_args = len(fn_node.args.args)
     num_defaults = len(fn_node.args.defaults)
@@ -149,36 +192,32 @@ def _lower_function_to_pyx(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> s
         if tname in _ANNOTATION_TO_CYTHON_LOCAL:
             if i >= default_offset:
                 def_node = fn_node.args.defaults[i - default_offset]
-                # If default is a sentinel like Path(), Query(), None, etc., do not lower parameter type
-                if isinstance(def_node, ast.Call):
-                    continue
-                if isinstance(def_node, ast.Constant) and def_node.value is None:
+                if _is_sentinel_default(def_node):
                     continue
             cython_locals[arg.arg] = _ANNOTATION_TO_CYTHON_LOCAL[tname]
 
+    for j, kwarg in enumerate(fn_node.args.kwonlyargs):
+        tname = _extract_type_name(kwarg.annotation)
+        if tname in _ANNOTATION_TO_CYTHON_LOCAL:
+            kw_def = fn_node.args.kw_defaults[j] if j < len(fn_node.args.kw_defaults) else None
+            if _is_sentinel_default(kw_def):
+                continue
+            cython_locals[kwarg.arg] = _ANNOTATION_TO_CYTHON_LOCAL[tname]
+
+    lowerer = _LocalAnnAssignLowerer(cython_locals)
     new_body: list[ast.stmt] = []
     for stmt in fn_node.body:
-        if (
-            isinstance(stmt, ast.AnnAssign)
-            and isinstance(stmt.target, ast.Name)
-            and stmt.value is not None
-        ):
-            tname = _extract_type_name(stmt.annotation)
-            if tname in _ANNOTATION_TO_CYTHON_LOCAL:
-                cython_locals[stmt.target.id] = _ANNOTATION_TO_CYTHON_LOCAL[tname]
-            # Convert `total: float = expr` into `total = expr` so @cython.locals governs C typing
-            assign_stmt = ast.Assign(targets=[stmt.target], value=stmt.value)
-            ast.copy_location(assign_stmt, stmt)
-            new_body.append(assign_stmt)
-        else:
-            new_body.append(stmt)
+        transformed = lowerer.visit(stmt)
+        if transformed is not None:
+            new_body.append(transformed)
+    if not new_body:
+        new_body.append(ast.Pass())
 
     decorators_src = [f"@{ast.unparse(d)}" for d in fn_node.decorator_list]
     if cython_locals:
         locals_kv = ", ".join(f"{k}={v}" for k, v in cython_locals.items())
         decorators_src.append(f"@cython.locals({locals_kv})")
 
-    # Build transformed AST function node without decorators to unparse clean signature + body
     if can_elide_async or not is_async:
         clean_fn: ast.AST = ast.FunctionDef(
             name=fn_node.name,
@@ -202,7 +241,6 @@ def _lower_function_to_pyx(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> s
 
     out_blocks = [*decorators_src, fn_src]
 
-    # Emit companion `cpdef` fast C entrypoint when coroutine is elided
     if can_elide_async:
         arg_names = [a.arg for a in fn_node.args.args]
         call_args = ", ".join(arg_names)
@@ -221,7 +259,7 @@ def transpile_module_to_pyx(source_code: str) -> str:
     """
     tree = ast.parse(source_code)
     header = [
-        "# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, binding=True, annotation_typing=False",
+        "# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, initializedcheck=False, infer_types=True, binding=True, annotation_typing=False",
         "cimport cython",
         "from buckthorn.schema import register_compiled_schema as _bt_register_compiled_schema",
         "",
@@ -254,21 +292,23 @@ def compile_pyx_module(
     workdir: str | Path = ".",
 ) -> ModuleType:
     """Compiles transpiled `.pyx` code into a native `.so` shared library and loads it."""
+    if not module_name.isidentifier():
+        raise ValueError(f"Invalid Cython module_name: {module_name!r}")
+
     work_path = Path(workdir).resolve()
     work_path.mkdir(parents=True, exist_ok=True)
 
     pyx_file = work_path / f"{module_name}.pyx"
     pyx_file.write_text(pyx_code, encoding="utf-8")
 
-    extra_compile_args = ["-O3", "-march=native", "-flto", "-Wno-unused-function"]
+    compile_args = ["-O3", "-march=native", "-Wno-unused-function"]
     if platform.machine() in ("x86_64", "AMD64"):
-        extra_compile_args.append("-msse4.2")
+        compile_args.append("-msse4.2")
 
     ext = Extension(
         name=module_name,
         sources=[str(pyx_file)],
-        extra_compile_args=extra_compile_args,
-        extra_link_args=["-flto"],
+        extra_compile_args=compile_args,
     )
     ext_modules = cythonize(
         [ext],
@@ -277,10 +317,10 @@ def compile_pyx_module(
             "boundscheck": False,
             "wraparound": False,
             "cdivision": True,
-            "binding": True,
-            "annotation_typing": False,
             "initializedcheck": False,
             "infer_types": True,
+            "binding": True,
+            "annotation_typing": False,
         },
         quiet=True,
     )
@@ -292,11 +332,16 @@ def compile_pyx_module(
     cmd.build_temp = str(work_path / "build_tmp")
     cmd.run()
 
-    so_files = list(work_path.glob(f"{module_name}*.so"))
-    if not so_files:
-        raise RuntimeError(f"Failed to compile Cython extension for {module_name}")
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    exact_so = work_path / f"{module_name}{ext_suffix}"
+    if exact_so.exists():
+        so_path = exact_so
+    else:
+        so_files = list(work_path.glob(f"{module_name}.*.so")) or list(work_path.glob(f"{module_name}.so"))
+        if not so_files:
+            raise RuntimeError(f"Failed to compile Cython extension for {module_name}")
+        so_path = so_files[0]
 
-    so_path = so_files[0]
     spec = importlib.util.spec_from_file_location(module_name, so_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load compiled extension from {so_path}")

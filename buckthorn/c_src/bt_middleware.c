@@ -1,5 +1,6 @@
 /* buckthorn/c_src/bt_middleware.c */
 #include "bt_middleware.h"
+#include "bt_audit.h"
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -11,7 +12,6 @@ static const char RESP_400_HOST[] =
     "Content-Length: 32\r\n"
     "Connection: keep-alive\r\n\r\n"
     "{\"detail\":\"Invalid Host header\"}";
-#define RESP_400_HOST_LEN (sizeof(RESP_400_HOST) - 1)
 
 static const char RESP_429_RL[] =
     "HTTP/1.1 429 Too Many Requests\r\n"
@@ -19,7 +19,12 @@ static const char RESP_429_RL[] =
     "Content-Length: 30\r\n"
     "Connection: keep-alive\r\n\r\n"
     "{\"detail\":\"Too Many Requests\"}";
-#define RESP_429_RL_LEN (sizeof(RESP_429_RL) - 1)
+
+static inline size_t bt_clamp_snprintf(int written, size_t buf_cap) {
+    if (written <= 0 || buf_cap == 0) return 0;
+    if ((size_t)written >= buf_cap) return buf_cap - 1;
+    return (size_t)written;
+}
 
 /* Fast 64-bit FNV-1a hash for client IP rate-limiting buckets */
 static inline uint64_t fnv1a_hash(const char *data, size_t len) {
@@ -41,6 +46,14 @@ void bt_middleware_configure_cors(
     const char *allow_methods, size_t methods_len,
     const char *allow_headers, size_t headers_len
 ) {
+    char clean_origin[256];
+    char clean_methods[256];
+    char clean_headers[256];
+
+    size_t o_len = bt_sanitize_header_str(allow_origin, origin_len, clean_origin, sizeof(clean_origin));
+    size_t m_len = bt_sanitize_header_str(allow_methods, methods_len, clean_methods, sizeof(clean_methods));
+    size_t h_len = bt_sanitize_header_str(allow_headers, headers_len, clean_headers, sizeof(clean_headers));
+
     mw->cors_enabled = 1;
 
     int pre_len = snprintf(
@@ -52,30 +65,18 @@ void bt_middleware_configure_cors(
         "Access-Control-Max-Age: 600\r\n"
         "Content-Length: 0\r\n"
         "Connection: keep-alive\r\n\r\n",
-        (int)origin_len, allow_origin,
-        (int)methods_len, allow_methods,
-        (int)headers_len, allow_headers
+        (int)o_len, clean_origin,
+        (int)m_len, clean_methods,
+        (int)h_len, clean_headers
     );
-    if (pre_len < 0) {
-        mw->cors_preflight_wire_len = 0;
-    } else if ((size_t)pre_len >= sizeof(mw->cors_preflight_wire)) {
-        mw->cors_preflight_wire_len = sizeof(mw->cors_preflight_wire) - 1;
-    } else {
-        mw->cors_preflight_wire_len = (size_t)pre_len;
-    }
+    mw->cors_preflight_wire_len = bt_clamp_snprintf(pre_len, sizeof(mw->cors_preflight_wire));
 
     int app_len = snprintf(
         mw->cors_append_hdrs, sizeof(mw->cors_append_hdrs),
         "Access-Control-Allow-Origin: %.*s\r\n",
-        (int)origin_len, allow_origin
+        (int)o_len, clean_origin
     );
-    if (app_len < 0) {
-        mw->cors_append_hdrs_len = 0;
-    } else if ((size_t)app_len >= sizeof(mw->cors_append_hdrs)) {
-        mw->cors_append_hdrs_len = sizeof(mw->cors_append_hdrs) - 1;
-    } else {
-        mw->cors_append_hdrs_len = (size_t)app_len;
-    }
+    mw->cors_append_hdrs_len = bt_clamp_snprintf(app_len, sizeof(mw->cors_append_hdrs));
 }
 
 void bt_middleware_configure_ratelimit(
@@ -94,10 +95,9 @@ void bt_middleware_configure_trusted_host(
     const char *allowed_host, size_t host_len
 ) {
     mw->trusted_host_enabled = 1;
-    size_t clen = host_len < sizeof(mw->allowed_host) - 1 ? host_len : sizeof(mw->allowed_host) - 1;
-    memcpy(mw->allowed_host, allowed_host, clen);
-    mw->allowed_host[clen] = '\0';
-    mw->allowed_host_len = clen;
+    mw->allowed_host_len = bt_sanitize_header_str(
+        allowed_host, host_len, mw->allowed_host, sizeof(mw->allowed_host)
+    );
 }
 
 void bt_middleware_configure_sec_headers(
@@ -106,23 +106,25 @@ void bt_middleware_configure_sec_headers(
     const char *ctype_opts, size_t ctype_len,
     const char *hsts, size_t hsts_len
 ) {
+    char clean_frame[128];
+    char clean_ctype[128];
+    char clean_hsts[256];
+
+    size_t f_len = bt_sanitize_header_str(frame_opts, frame_len, clean_frame, sizeof(clean_frame));
+    size_t c_len = bt_sanitize_header_str(ctype_opts, ctype_len, clean_ctype, sizeof(clean_ctype));
+    size_t h_len = bt_sanitize_header_str(hsts, hsts_len, clean_hsts, sizeof(clean_hsts));
+
     mw->sec_headers_enabled = 1;
     int len = snprintf(
         mw->sec_append_hdrs, sizeof(mw->sec_append_hdrs),
         "X-Frame-Options: %.*s\r\n"
         "X-Content-Type-Options: %.*s\r\n"
         "Strict-Transport-Security: %.*s\r\n",
-        (int)frame_len, frame_opts,
-        (int)ctype_len, ctype_opts,
-        (int)hsts_len, hsts
+        (int)f_len, clean_frame,
+        (int)c_len, clean_ctype,
+        (int)h_len, clean_hsts
     );
-    if (len < 0) {
-        mw->sec_append_hdrs_len = 0;
-    } else if ((size_t)len >= sizeof(mw->sec_append_hdrs)) {
-        mw->sec_append_hdrs_len = sizeof(mw->sec_append_hdrs) - 1;
-    } else {
-        mw->sec_append_hdrs_len = (size_t)len;
-    }
+    mw->sec_append_hdrs_len = bt_clamp_snprintf(len, sizeof(mw->sec_append_hdrs));
 }
 
 int bt_middleware_run_pre(
@@ -143,7 +145,7 @@ int bt_middleware_run_pre(
             if (!bt_find_header(headers, num_headers, "Host", 4, &host_hdr) ||
                 host_hdr.len != mw->allowed_host_len ||
                 strncasecmp(host_hdr.ptr, mw->allowed_host, mw->allowed_host_len) != 0) {
-                size_t len = RESP_400_HOST_LEN;
+                const size_t len = sizeof(RESP_400_HOST) - 1;
                 memcpy(resp_wire_buf, RESP_400_HOST, len);
                 *out_status_code = 400;
                 *out_wire_len = len;
@@ -167,10 +169,31 @@ int bt_middleware_run_pre(
     /* 3. Pure C FNV-1a Hash Table Rate Limiter */
     if (mw->ratelimit_enabled) {
         bt_slice_t client_ip;
-        if (!bt_find_header(headers, num_headers, "X-Forwarded-For", 15, &client_ip)) {
+        if (!bt_find_header(headers, num_headers, "X-Forwarded-For", 15, &client_ip) ||
+            client_ip.len == 0) {
             client_ip.ptr = "127.0.0.1";
             client_ip.len = 9;
+        } else {
+            /* Extract only the first IP in X-Forwarded-For and trim whitespace */
+            const char *comma = (const char *)memchr(client_ip.ptr, ',', client_ip.len);
+            if (comma) {
+                client_ip.len = (size_t)(comma - client_ip.ptr);
+            }
+            while (client_ip.len > 0 && (*client_ip.ptr == ' ' || *client_ip.ptr == '\t')) {
+                client_ip.ptr++;
+                client_ip.len--;
+            }
+            while (client_ip.len > 0 &&
+                   (client_ip.ptr[client_ip.len - 1] == ' ' ||
+                    client_ip.ptr[client_ip.len - 1] == '\t')) {
+                client_ip.len--;
+            }
+            if (client_ip.len == 0) {
+                client_ip.ptr = "127.0.0.1";
+                client_ip.len = 9;
+            }
         }
+
         uint64_t h = fnv1a_hash(client_ip.ptr, client_ip.len);
         bt_rl_bucket_t *b = &mw->rl_buckets[h & (BT_RL_BUCKETS - 1)];
 
@@ -182,14 +205,16 @@ int bt_middleware_run_pre(
 #endif
         int64_t now_sec = (int64_t)ts.tv_sec;
 
-        if (b->key_hash != h || (now_sec - b->window_start_sec) >= mw->rl_window_sec) {
+        if (b->key_hash == 0 || (now_sec - b->window_start_sec) >= mw->rl_window_sec) {
             b->key_hash = h;
             b->window_start_sec = now_sec;
             b->count = 1;
         } else {
+            /* Active window: never reset count on hash collision */
+            b->key_hash = h;
             b->count++;
             if (b->count > mw->rl_max_requests) {
-                size_t len = RESP_429_RL_LEN;
+                const size_t len = sizeof(RESP_429_RL) - 1;
                 memcpy(resp_wire_buf, RESP_429_RL, len);
                 *out_status_code = 429;
                 *out_wire_len = len;

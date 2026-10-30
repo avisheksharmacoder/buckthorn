@@ -3,6 +3,7 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/sha.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -26,36 +27,66 @@ static const int8_t B64_DECODE_TABLE[256] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
 };
 
+/* Constant-time comparison that does not leak secret length via early return */
 int bt_const_time_eq(const char *a, size_t a_len, const char *b, size_t b_len) {
-    if (a_len != b_len) return 0;
-    if (a_len == 0) return 1;
-    return CRYPTO_memcmp(a, b, a_len) == 0 ? 1 : 0;
+    if (!a || !b) return 0;
+    unsigned char ha[SHA256_DIGEST_LENGTH];
+    unsigned char hb[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)a, a_len, ha);
+    SHA256((const unsigned char *)b, b_len, hb);
+    int digest_eq = (CRYPTO_memcmp(ha, hb, SHA256_DIGEST_LENGTH) == 0);
+    int len_eq = ((a_len ^ b_len) == 0);
+    return (digest_eq & len_eq) ? 1 : 0;
 }
 
-/* Unified Base64 & Base64URL decoder (handles both padded and unpadded strings) */
+/* Fast 4-byte unrolled Base64 & Base64URL decoder */
 int bt_base64url_decode(const char *in, size_t in_len, uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (!in || !out || !out_len) return -1;
     while (in_len > 0 && in[in_len - 1] == '=') {
         in_len--;
     }
-    if (in_len % 4 == 1) return -1;
+    if ((in_len & 3) == 1) return -1;
 
-    size_t expected_len = (in_len * 3) / 4;
+    size_t expected_len = (in_len / 4) * 3 + ((in_len & 3) ? ((in_len & 3) - 1) : 0);
     if (expected_len > out_cap) return -1;
 
+    size_t i = 0;
     size_t j = 0;
-    uint32_t buf = 0;
-    int bits = 0;
+    size_t main_chunks = in_len & ~((size_t)3);
 
-    for (size_t i = 0; i < in_len; i++) {
-        int8_t v = B64_DECODE_TABLE[(uint8_t)in[i]];
-        if (v < 0) return -1;
-        buf = (buf << 6) | (uint32_t)v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out[j++] = (uint8_t)((buf >> bits) & 0xFF);
-        }
+    for (; i < main_chunks; i += 4) {
+        int8_t v0 = B64_DECODE_TABLE[(uint8_t)in[i]];
+        int8_t v1 = B64_DECODE_TABLE[(uint8_t)in[i + 1]];
+        int8_t v2 = B64_DECODE_TABLE[(uint8_t)in[i + 2]];
+        int8_t v3 = B64_DECODE_TABLE[(uint8_t)in[i + 3]];
+        if ((v0 | v1 | v2 | v3) < 0) return -1;
+
+        uint32_t quad = ((uint32_t)v0 << 18) |
+                        ((uint32_t)v1 << 12) |
+                        ((uint32_t)v2 << 6)  |
+                        (uint32_t)v3;
+        out[j]     = (uint8_t)((quad >> 16) & 0xFF);
+        out[j + 1] = (uint8_t)((quad >> 8) & 0xFF);
+        out[j + 2] = (uint8_t)(quad & 0xFF);
+        j += 3;
     }
+
+    size_t rem = in_len - i;
+    if (rem == 2) {
+        int8_t v0 = B64_DECODE_TABLE[(uint8_t)in[i]];
+        int8_t v1 = B64_DECODE_TABLE[(uint8_t)in[i + 1]];
+        if ((v0 | v1) < 0) return -1;
+        out[j++] = (uint8_t)(((uint32_t)v0 << 2) | ((uint32_t)v1 >> 4));
+    } else if (rem == 3) {
+        int8_t v0 = B64_DECODE_TABLE[(uint8_t)in[i]];
+        int8_t v1 = B64_DECODE_TABLE[(uint8_t)in[i + 1]];
+        int8_t v2 = B64_DECODE_TABLE[(uint8_t)in[i + 2]];
+        if ((v0 | v1 | v2) < 0) return -1;
+        uint32_t triple = ((uint32_t)v0 << 12) | ((uint32_t)v1 << 6) | (uint32_t)v2;
+        out[j++] = (uint8_t)((triple >> 10) & 0xFF);
+        out[j++] = (uint8_t)((triple >> 2) & 0xFF);
+    }
+
     *out_len = j;
     return 0;
 }
@@ -114,16 +145,15 @@ bt_sec_result_t bt_jwt_verify_hs256(
     const char *dot1 = (const char *)memchr(tok, '.', tok_len);
     if (!dot1) return BT_SEC_ERR_UNAUTHORIZED;
 
-    size_t rem_len = tok_len - (size_t)(dot1 - tok) - 1;
+    size_t hdr_b64_len = (size_t)(dot1 - tok);
+    size_t rem_len = tok_len - hdr_b64_len - 1;
     const char *dot2 = (const char *)memchr(dot1 + 1, '.', rem_len);
     if (!dot2) return BT_SEC_ERR_UNAUTHORIZED;
 
-    /* Fast path: canonical 36-byte HS256 header check avoids Base64URL decode and JSON parse */
-    size_t hdr_b64_len = (size_t)(dot1 - tok);
-    if (hdr_b64_len == 36 && memcmp(tok, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", 36) == 0) {
-        /* Standard HS256 header matched */
-    } else {
-        /* Fallback: decode and parse custom/non-standard JWT header */
+    /* Fast-path for canonical 36-byte HS256 JWT headers; fallback to full yyjson parse */
+    if (!(hdr_b64_len == 36 &&
+          (memcmp(tok, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", 36) == 0 ||
+           memcmp(tok, "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9", 36) == 0))) {
         char hdr_json_buf[128];
         size_t hdr_json_len = 0;
         if (bt_base64url_decode(
@@ -147,7 +177,8 @@ bt_sec_result_t bt_jwt_verify_hs256(
         }
         yyjson_val *alg_val = yyjson_obj_getn(hdr_root, "alg", 3);
         if (!alg_val || !yyjson_is_str(alg_val) ||
-            !bt_const_time_eq(yyjson_get_str(alg_val), yyjson_get_len(alg_val), "HS256", 5)) {
+            yyjson_get_len(alg_val) != 5 ||
+            CRYPTO_memcmp(yyjson_get_str(alg_val), "HS256", 5) != 0) {
             return BT_SEC_ERR_UNAUTHORIZED;
         }
     }
@@ -165,7 +196,7 @@ bt_sec_result_t bt_jwt_verify_hs256(
         return BT_SEC_ERR_UNAUTHORIZED;
     }
 
-    /* 2. Compute HMAC-SHA256 reusing thread-local HMAC_CTX (zero malloc per request) */
+    /* 2. Compute HMAC-SHA256 reusing thread-local HMAC_CTX (zero malloc per request, Law #2) */
     uint8_t mac[EVP_MAX_MD_SIZE];
     unsigned int mac_len = 0;
     if (!tls_hmac_ctx) {
@@ -186,9 +217,10 @@ bt_sec_result_t bt_jwt_verify_hs256(
     }
 
     /* 4. Base64URL-decode payload into caller buffer and parse with yyjson */
-    if (bt_base64url_decode(
+    if (payload_buf_cap < 8 ||
+        bt_base64url_decode(
             payload_b64, payload_b64_len,
-            (uint8_t *)payload_buf, payload_buf_cap - 1, out_payload_len
+            (uint8_t *)payload_buf, payload_buf_cap - 4, out_payload_len
         ) != 0) {
         return BT_SEC_ERR_UNAUTHORIZED;
     }
@@ -198,29 +230,20 @@ bt_sec_result_t bt_jwt_verify_hs256(
         return BT_SEC_ERR_UNAUTHORIZED;
     }
 
-    /* 5. Check `exp` claim if present */
+    /* 5. Validate `exp` and `nbf` claims */
     yyjson_val *exp_val = yyjson_obj_getn(out_jdoc->root, "exp", 3);
-    if (exp_val) {
-        if (!yyjson_is_int(exp_val)) {
-            return BT_SEC_ERR_UNAUTHORIZED;
-        }
-        int64_t exp_ts = yyjson_get_sint(exp_val);
-        int64_t now_ts = (int64_t)time(NULL);
-        if (exp_ts <= now_ts) {
-            return BT_SEC_ERR_UNAUTHORIZED;
-        }
-    }
-
-    /* Check `nbf` (Not Before) claim if present */
     yyjson_val *nbf_val = yyjson_obj_getn(out_jdoc->root, "nbf", 3);
-    if (nbf_val) {
-        if (!yyjson_is_int(nbf_val)) {
-            return BT_SEC_ERR_UNAUTHORIZED;
-        }
-        int64_t nbf_ts = yyjson_get_sint(nbf_val);
+    if (exp_val || nbf_val) {
         int64_t now_ts = (int64_t)time(NULL);
-        if (nbf_ts > now_ts) {
-            return BT_SEC_ERR_UNAUTHORIZED;
+        if (exp_val) {
+            if (!yyjson_is_int(exp_val) || yyjson_get_sint(exp_val) <= now_ts) {
+                return BT_SEC_ERR_UNAUTHORIZED;
+            }
+        }
+        if (nbf_val) {
+            if (!yyjson_is_int(nbf_val) || yyjson_get_sint(nbf_val) > now_ts) {
+                return BT_SEC_ERR_UNAUTHORIZED;
+            }
         }
     }
 
@@ -297,7 +320,8 @@ bt_sec_result_t bt_verify_basic_auth(
     }
 
     size_t decoded_len = 0;
-    if (bt_base64_decode(b64_ptr, b64_len, (uint8_t *)decode_buf, decode_buf_cap - 1, &decoded_len) != 0) {
+    if (decode_buf_cap < 4 ||
+        bt_base64_decode(b64_ptr, b64_len, (uint8_t *)decode_buf, decode_buf_cap - 1, &decoded_len) != 0) {
         return BT_SEC_ERR_UNAUTHORIZED;
     }
     decode_buf[decoded_len] = '\0';
@@ -315,9 +339,16 @@ bt_sec_result_t bt_verify_basic_auth(
     out_pass->len = decoded_len - out_user->len - 1;
     out_pass->found = 1;
 
-    if (expected_user && expected_user_len > 0) {
-        int user_ok = bt_const_time_eq(out_user->ptr, out_user->len, expected_user, expected_user_len);
-        int pass_ok = bt_const_time_eq(out_pass->ptr, out_pass->len, expected_pass, expected_pass_len);
+    /* Verify credentials in constant time whenever either expected username or password is set */
+    if ((expected_user && expected_user_len > 0) || (expected_pass && expected_pass_len > 0)) {
+        int user_ok = bt_const_time_eq(
+            out_user->ptr, out_user->len,
+            expected_user ? expected_user : "", expected_user_len
+        );
+        int pass_ok = bt_const_time_eq(
+            out_pass->ptr, out_pass->len,
+            expected_pass ? expected_pass : "", expected_pass_len
+        );
         if (!(user_ok & pass_ok)) {
             return BT_SEC_ERR_UNAUTHORIZED;
         }

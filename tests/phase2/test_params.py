@@ -136,3 +136,77 @@ def test_phase2_parameter_extraction_speed_gate():
     rps = iterations / elapsed
     assert res.status_code == 200
     assert rps > 80_000, f"Expected >80,000 RPS with 4 typed C params, got {rps:,.0f} RPS"
+
+
+def test_url_percent_decoding_and_null_byte_rejection():
+    import pathlib
+
+    app = Buckthorn()
+
+    @app.get("/users/{email}")
+    def get_user(
+        email: str = Path(),
+        query: str = Query(),
+        session: str = Cookie(default="none"),
+    ):
+        return f"{email}|{query}|{session}".encode()
+
+    client = RawTestClient(app)
+
+    # 1. Valid percent-encoded path, query with %20 and '+', and cookie with %3D
+    res = client.get(
+        "/users/alice%40example.com?query=hello%20world%21+2026",
+        headers={"Cookie": "session=token%3Dabc"},
+    )
+    assert res.status_code == 200
+    assert res.body == b"alice@example.com|hello world! 2026|token=abc"
+
+    # 2. Null byte %00 in path is rejected by C audit -> 400 Bad Request
+    res_path_null = client.get(
+        "/users/alice%00admin?query=valid",
+        headers={"Cookie": "session=token"},
+    )
+    assert res_path_null.status_code == 400
+
+    # 3. Null byte %00 in query string is rejected by C audit -> 400 Bad Request
+    res_query_null = client.get(
+        "/users/alice?query=bad%00val",
+        headers={"Cookie": "session=token"},
+    )
+    assert res_query_null.status_code == 400
+
+    # 4. Null byte %00 in cookie is rejected by bt_url_decode_slice -> falls back to default "none"
+    res_cookie_null = client.get(
+        "/users/alice?query=valid",
+        headers={"Cookie": "session=bad%00token"},
+    )
+    assert res_cookie_null.status_code == 200
+    assert res_cookie_null.body == b"alice|valid|none"
+
+    # 5. Truncated %XX sequence in query is rejected by C audit (or decoder) -> 400
+    res_trunc = client.get(
+        "/users/alice?query=bad%2",
+        headers={"Cookie": "session=token"},
+    )
+    assert res_trunc.status_code == 400
+
+    # 6. Invalid hex in query is rejected by C audit (or decoder) -> 400
+    res_inv = client.get(
+        "/users/alice?query=bad%ZZ",
+        headers={"Cookie": "session=token"},
+    )
+    assert res_inv.status_code == 400
+
+
+def test_pep561_typing_assets():
+    import pathlib
+
+    pkg_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "buckthorn"
+    py_typed = pkg_dir / "py.typed"
+    core_pyi = pkg_dir / "_core.pyi"
+
+    assert py_typed.exists(), "buckthorn/py.typed marker file must exist for PEP 561 compliance"
+    assert core_pyi.exists(), "buckthorn/_core.pyi type stub file must exist"
+    assert "class CoreRouter:" in core_pyi.read_text(encoding="utf-8")
+    assert "class Request:" in core_pyi.read_text(encoding="utf-8")
+

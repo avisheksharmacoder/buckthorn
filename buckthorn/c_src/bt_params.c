@@ -1,16 +1,98 @@
 /* buckthorn/c_src/bt_params.c */
 #include "bt_params.h"
 #include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+#define BT_DECODE_RING_SIZE 16384
+
+static _Thread_local char tls_decode_ring[BT_DECODE_RING_SIZE];
+static _Thread_local size_t tls_decode_offset = 0;
+
+static const int8_t HEX_DECODE_TABLE[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,-1,-1,-1,-1,-1,-1,
+    -1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+};
+
+int bt_url_decode_slice(bt_slice_t *slice, int plus_as_space) {
+    if (!slice || !slice->found || !slice->ptr || slice->len == 0) {
+        return 0;
+    }
+
+    const char *src = slice->ptr;
+    size_t len = slice->len;
+
+    /* Fast path: if no '%' and no '+', keep the zero-copy wire slice untouched */
+    const char *has_pct = (const char *)memchr(src, '%', len);
+    const char *has_plus = plus_as_space ? (const char *)memchr(src, '+', len) : NULL;
+    if (!has_pct && !has_plus) {
+        return 0;
+    }
+
+    if (len >= BT_DECODE_RING_SIZE) {
+        return -1;
+    }
+    if (tls_decode_offset + len + 1 > BT_DECODE_RING_SIZE) {
+        tls_decode_offset = 0;
+    }
+
+    char *dst = tls_decode_ring + tls_decode_offset;
+    size_t out_idx = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        char c = src[i];
+        if (c == '%') {
+            if (i + 2 >= len) {
+                return -1; /* Truncated %XX sequence */
+            }
+            int8_t hi = HEX_DECODE_TABLE[(unsigned char)src[i + 1]];
+            int8_t lo = HEX_DECODE_TABLE[(unsigned char)src[i + 2]];
+            if ((hi | lo) < 0) {
+                return -1; /* Invalid hex digit */
+            }
+            uint8_t decoded = (uint8_t)((hi << 4) | lo);
+            if (decoded == 0) {
+                return -1; /* Reject %00 null byte injection */
+            }
+            dst[out_idx++] = (char)decoded;
+            i += 2;
+        } else if (plus_as_space && c == '+') {
+            dst[out_idx++] = ' ';
+        } else {
+            dst[out_idx++] = c;
+        }
+    }
+
+    dst[out_idx] = '\0';
+    tls_decode_offset += out_idx + 1;
+    slice->ptr = dst;
+    slice->len = out_idx;
+    return 0;
+}
 
 int bt_find_query_param(const char *query, size_t query_len,
                         const char *key, size_t key_len, bt_slice_t *out_val) {
     out_val->ptr = NULL;
     out_val->len = 0;
     out_val->found = 0;
-    if (!query || query_len == 0) return 0;
+    if (!query || query_len == 0 || !key || key_len == 0) return 0;
 
     const char *cur = query;
     const char *end = query + query_len;
@@ -26,6 +108,12 @@ int bt_find_query_param(const char *query, size_t query_len,
                 out_val->ptr = eq + 1;
                 out_val->len = (size_t)(pair_end - (eq + 1));
                 out_val->found = 1;
+                if (bt_url_decode_slice(out_val, 1) != 0) {
+                    out_val->ptr = NULL;
+                    out_val->len = 0;
+                    out_val->found = 0;
+                    return 0;
+                }
                 return 1;
             }
         }
@@ -40,16 +128,18 @@ int bt_find_header(struct phr_header *headers, size_t num_headers,
     out_val->ptr = NULL;
     out_val->len = 0;
     out_val->found = 0;
+    if (!headers || !key || key_len == 0) return 0;
 
+    const unsigned char k0 = (unsigned char)key[0];
     for (size_t i = 0; i < num_headers; i++) {
-        if (headers[i].name && headers[i].name_len == key_len && key_len > 0) {
-            if (((headers[i].name[0] ^ key[0]) & ~0x20) == 0) {
-                if (strncasecmp(headers[i].name, key, key_len) == 0) {
-                    out_val->ptr = headers[i].value;
-                    out_val->len = headers[i].value_len;
-                    out_val->found = 1;
-                    return 1;
-                }
+        if (headers[i].name && headers[i].name_len == key_len) {
+            /* Fast case-insensitive first-byte pre-check before calling strncasecmp */
+            if ((((unsigned char)headers[i].name[0] ^ k0) & ~0x20) == 0 &&
+                strncasecmp(headers[i].name, key, key_len) == 0) {
+                out_val->ptr = headers[i].value;
+                out_val->len = headers[i].value_len;
+                out_val->found = 1;
+                return 1;
             }
         }
     }
@@ -81,6 +171,12 @@ int bt_find_cookie(struct phr_header *headers, size_t num_headers,
                 out_val->ptr = eq + 1;
                 out_val->len = (size_t)(pair_end - (eq + 1));
                 out_val->found = 1;
+                if (bt_url_decode_slice(out_val, 0) != 0) {
+                    out_val->ptr = NULL;
+                    out_val->len = 0;
+                    out_val->found = 0;
+                    return 0;
+                }
                 return 1;
             }
         }
@@ -102,54 +198,39 @@ bt_val_error_t bt_parse_int64_checked(
     int has_lt, int64_t lt,
     int64_t *out_val
 ) {
-    if (!slice.found || slice.len == 0 || !slice.ptr) {
+    if (!slice.found || !slice.ptr || slice.len == 0 || slice.len > 20) {
         return BT_ERR_TYPE_INT;
     }
 
     const char *p = slice.ptr;
-    size_t rem = slice.len;
-    int negative = 0;
+    const char *end = p + slice.len;
+    int neg = 0;
 
     if (*p == '-') {
-        negative = 1;
+        neg = 1;
         p++;
-        rem--;
+        if (p == end) return BT_ERR_TYPE_INT;
     } else if (*p == '+') {
         p++;
-        rem--;
-    }
-
-    if (rem == 0) {
-        return BT_ERR_TYPE_INT;
+        if (p == end) return BT_ERR_TYPE_INT;
     }
 
     uint64_t acc = 0;
-    uint64_t limit = negative ? 9223372036854775808ULL : 9223372036854775807ULL;
+    const uint64_t limit = neg ? ((uint64_t)INT64_MAX + 1ULL) : (uint64_t)INT64_MAX;
 
-    while (rem > 0) {
-        char c = *p;
-        if (c < '0' || c > '9') {
+    for (; p < end; p++) {
+        uint8_t d = (uint8_t)((unsigned char)*p - (unsigned char)'0');
+        if (d > 9) {
             return BT_ERR_TYPE_INT;
         }
-        uint64_t d = (uint64_t)(c - '0');
-        if (acc > (limit - d) / 10ULL) {
+        if (acc > (limit - (uint64_t)d) / 10ULL) {
             return BT_ERR_TYPE_INT;
         }
-        acc = acc * 10ULL + d;
-        p++;
-        rem--;
+        acc = acc * 10ULL + (uint64_t)d;
     }
 
-    int64_t v;
-    if (negative) {
-        if (acc == 9223372036854775808ULL) {
-            v = INT64_MIN;
-        } else {
-            v = -(int64_t)acc;
-        }
-    } else {
-        v = (int64_t)acc;
-    }
+    int64_t v = neg ? (acc == ((uint64_t)INT64_MAX + 1ULL) ? INT64_MIN : -(int64_t)acc)
+                    : (int64_t)acc;
 
     if (has_ge && v < ge) return BT_ERR_NUMBER_GE;
     if (has_le && v > le) return BT_ERR_NUMBER_LE;
@@ -168,9 +249,17 @@ bt_val_error_t bt_parse_double_checked(
     int has_lt, double lt,
     double *out_val
 ) {
-    if (!slice.found || slice.len == 0 || slice.len >= 63) {
+    if (!slice.found || !slice.ptr || slice.len == 0 || slice.len >= 63) {
         return BT_ERR_TYPE_FLOAT;
     }
+
+    /* Reject leading or trailing whitespace which strtod() would otherwise silently skip */
+    unsigned char first = (unsigned char)slice.ptr[0];
+    unsigned char last = (unsigned char)slice.ptr[slice.len - 1];
+    if (first <= 0x20 || last <= 0x20) {
+        return BT_ERR_TYPE_FLOAT;
+    }
+
     char buf[64];
     memcpy(buf, slice.ptr, slice.len);
     buf[slice.len] = '\0';
@@ -178,7 +267,8 @@ bt_val_error_t bt_parse_double_checked(
     char *endptr = NULL;
     errno = 0;
     double v = strtod(buf, &endptr);
-    if (errno != 0 || endptr != buf + slice.len) {
+    /* Reject parse errors, trailing garbage, and IEEE-754 NaN / Infinity */
+    if (errno != 0 || endptr != buf + slice.len || !isfinite(v)) {
         return BT_ERR_TYPE_FLOAT;
     }
 

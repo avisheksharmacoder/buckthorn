@@ -85,17 +85,21 @@ def test_schema_optional_serialization_roundtrip():
 
     client = RawTestClient(app)
     # Missing optional count field
+    body1 = b'{"title": "Widget"}'
     res = client.send_raw(
-        b"POST /items HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n"
-        b'{"title": "Widget"}'
+        b"POST /items HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body1)}\r\n\r\n".encode("ascii")
+        + body1
     )
     assert res.status_code == 200
     assert res.json() == {"title": "Widget", "count": None}
 
     # Provided optional count field
+    body2 = b'{"title": "Widget", "count": 7}'
     res2 = client.send_raw(
-        b"POST /items HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 29\r\n\r\n"
-        b'{"title": "Widget", "count": 7}'
+        b"POST /items HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body2)}\r\n\r\n".encode("ascii")
+        + body2
     )
     assert res2.status_code == 200
     assert res2.json() == {"title": "Widget", "count": 7}

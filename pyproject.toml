@@ -11,8 +11,6 @@ license = { text = "MIT" }
 authors = [{ name = "Avishek Sharma" }]
 requires-python = ">=3.11"
 dependencies = [
-    "Cython>=3.0.10",
-    "setuptools>=68.0",
     "uvloop>=0.21.0",
 ]
 
@@ -20,7 +18,36 @@ dependencies = [
 buckthorn = "buckthorn.cli:main"
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "hypothesis>=6.100",
+build = [
+    "Cython>=3.0.10",
+    "setuptools>=68.0",
 ]
+dev = [
+    "Cython>=3.0.10",
+    "setuptools>=68.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "hypothesis>=6.98.0",
+]
+
+[tool.setuptools.package-data]
+buckthorn = ["py.typed", "_core.pyi", "_core.pxd", "c_src/*.h", "c_vendor/*.h"]
+
+[tool.cibuildwheel]
+build = "cp311-* cp312-* cp313-* cp314-*"
+skip = "*-win32 *-manylinux_i686 *-musllinux*"
+build-frontend = "build"
+environment = { BUCKTHORN_PORTABLE_WHEEL = "1" }
+test-extras = ["dev"]
+test-command = "pytest {project}/tests/phase1/test_core_router.py {project}/tests/phase3/test_schema_serde.py"
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+before-all = "dnf install -y libuv-devel openssl-devel || yum install -y libuv-devel openssl-devel"
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+before-all = "brew install libuv openssl@3"
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"

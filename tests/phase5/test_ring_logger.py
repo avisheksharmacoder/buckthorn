@@ -45,6 +45,22 @@ def test_lock_free_ring_logger_structured_json_and_types(tmp_path):
     assert entry3["key"] == "user:42"
 
 
+def test_ring_logger_non_finite_float_json_safety(tmp_path):
+    """Verify NaN and Infinity floats serialize as null in JSON (RFC 8259 compliance)."""
+    log_file = tmp_path / "floats.log"
+    logger = RingLogger(filepath=str(log_file), capacity=1024)
+
+    logger.info("float_check", nan_val=float("nan"), inf_val=float("inf"))
+    logger.flush_and_stop()
+
+    lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+
+    entry = json.loads(lines[0])
+    assert entry["nan_val"] is None
+    assert entry["inf_val"] is None
+
+
 def test_app_logger_and_pure_c_http_access_logging(tmp_path):
     log_file = tmp_path / "app_access.log"
     app = Buckthorn(log_file=str(log_file), access_log=True)

@@ -1,12 +1,21 @@
 /* buckthorn/c_src/bt_logger.c */
 #include "bt_logger.h"
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BT_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define BT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define BT_LIKELY(x)   (x)
+#define BT_UNLIKELY(x) (x)
+#endif
 
 #define BT_FLUSH_BATCH_SIZE 64
 #define BT_LINE_BUF_SIZE    512
@@ -23,17 +32,17 @@ static inline uint64_t bt_now_ns(void) {
 
 static size_t next_power_of_two(size_t n) {
     size_t p = 1024;
-    while (p < n) p <<= 1;
+    while (p < n && p < (1ULL << 30)) p <<= 1;
     return p;
 }
 
 static inline void bt_copy_json_safe(char *dst, const char *src, size_t len) {
     for (size_t i = 0; i < len; i++) {
-        char c = src[i];
-        if (c == '"' || c == '\\' || c == '\r' || c == '\n' || (unsigned char)c < 0x20) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\' || c == '\r' || c == '\n' || c < 0x20 || c == 0x7F) {
             dst[i] = '_';
         } else {
-            dst[i] = c;
+            dst[i] = (char)c;
         }
     }
     dst[len] = '\0';
@@ -49,9 +58,9 @@ static const char *level_to_str(uint8_t level) {
     }
 }
 
-/* Formats a single bt_log_entry_t into a JSON line inside line_buf */
+/* Formats a single bt_log_entry_t into a JSON line on the background consumer thread */
 static size_t format_entry_json(const bt_log_entry_t *e, char *line_buf, size_t cap) {
-    char clean_msg[sizeof(e->msg)];
+    char clean_msg[96];
     size_t mlen = e->msg_len < (sizeof(clean_msg) - 1) ? e->msg_len : (sizeof(clean_msg) - 1);
     bt_copy_json_safe(clean_msg, e->msg, mlen);
 
@@ -62,40 +71,57 @@ static size_t format_entry_json(const bt_log_entry_t *e, char *line_buf, size_t 
         level_to_str(e->level),
         (int)mlen, clean_msg
     );
-    if (pos < 0 || (size_t)pos >= cap - 4) return 0;
+    if (pos <= 0 || (size_t)pos >= cap - 4) return 0;
 
-    for (uint8_t i = 0; i < e->num_kvs && i < BT_LOG_MAX_KVS; i++) {
+    uint8_t n_kvs = e->num_kvs <= BT_LOG_MAX_KVS ? e->num_kvs : BT_LOG_MAX_KVS;
+    for (uint8_t i = 0; i < n_kvs; i++) {
         const bt_log_kv_t *kv = &e->kvs[i];
+        char clean_key[24];
+        size_t klen = kv->key_len < (sizeof(clean_key) - 1) ? kv->key_len : (sizeof(clean_key) - 1);
+        bt_copy_json_safe(clean_key, kv->key, klen);
+
         int added = 0;
+        size_t rem = cap - (size_t)pos;
+        if (rem <= 4) break;
+
         if (kv->val_type == BT_LOG_VAL_INT) {
             added = snprintf(
-                line_buf + pos, cap - (size_t)pos,
+                line_buf + pos, rem,
                 ",\"%.*s\":%lld",
-                (int)kv->key_len, kv->key, (long long)kv->v.i_val
+                (int)klen, clean_key, (long long)kv->v.i_val
             );
         } else if (kv->val_type == BT_LOG_VAL_FLOAT) {
-            added = snprintf(
-                line_buf + pos, cap - (size_t)pos,
-                ",\"%.*s\":%.6g",
-                (int)kv->key_len, kv->key, kv->v.f_val
-            );
+            if (isfinite(kv->v.f_val)) {
+                added = snprintf(
+                    line_buf + pos, rem,
+                    ",\"%.*s\":%.6g",
+                    (int)klen, clean_key, kv->v.f_val
+                );
+            } else {
+                added = snprintf(
+                    line_buf + pos, rem,
+                    ",\"%.*s\":null",
+                    (int)klen, clean_key
+                );
+            }
         } else if (kv->val_type == BT_LOG_VAL_BOOL) {
             added = snprintf(
-                line_buf + pos, cap - (size_t)pos,
+                line_buf + pos, rem,
                 ",\"%.*s\":%s",
-                (int)kv->key_len, kv->key, kv->v.b_val ? "true" : "false"
+                (int)klen, clean_key, kv->v.b_val ? "true" : "false"
             );
         } else if (kv->val_type == BT_LOG_VAL_STR) {
             char clean_val[64];
             size_t slen = kv->str_len < (sizeof(clean_val) - 1) ? kv->str_len : (sizeof(clean_val) - 1);
             bt_copy_json_safe(clean_val, kv->v.s_val, slen);
             added = snprintf(
-                line_buf + pos, cap - (size_t)pos,
+                line_buf + pos, rem,
                 ",\"%.*s\":\"%.*s\"",
-                (int)kv->key_len, kv->key, (int)slen, clean_val
+                (int)klen, clean_key, (int)slen, clean_val
             );
         }
-        if (added > 0 && (size_t)(pos + added) < cap - 3) {
+
+        if (added > 0 && (size_t)pos + (size_t)added < cap - 3) {
             pos += added;
         }
     }
@@ -147,9 +173,25 @@ static void *logger_consumer_thread(void *arg) {
     return NULL;
 }
 
+/* Respawns the background consumer pthread if the process was forked via os.fork() */
+static void bt_logger_reinit_after_fork(bt_logger_t *logger) {
+    pid_t cur_pid = getpid();
+    if (logger->owner_pid == cur_pid) return;
+
+    logger->owner_pid = cur_pid;
+    size_t w = atomic_load_explicit(&logger->write_idx, memory_order_relaxed);
+    atomic_store_explicit(&logger->read_idx, w, memory_order_relaxed);
+    logger->cached_read_idx = w;
+    atomic_store_explicit(&logger->running, 1, memory_order_release);
+    pthread_create(&logger->thread, NULL, logger_consumer_thread, logger);
+}
+
 bt_logger_t *bt_logger_create(const char *filepath, size_t capacity) {
-    bt_logger_t *logger = (bt_logger_t *)calloc(1, sizeof(bt_logger_t));
-    if (!logger) return NULL;
+    bt_logger_t *logger = NULL;
+    if (posix_memalign((void **)&logger, 64, sizeof(bt_logger_t)) != 0 || !logger) {
+        return NULL;
+    }
+    memset(logger, 0, sizeof(bt_logger_t));
 
     size_t cap = next_power_of_two(capacity);
     logger->slots = (bt_log_entry_t *)calloc(cap, sizeof(bt_log_entry_t));
@@ -160,12 +202,14 @@ bt_logger_t *bt_logger_create(const char *filepath, size_t capacity) {
 
     logger->capacity = cap;
     logger->mask = cap - 1;
+    logger->cached_read_idx = 0;
+    logger->owner_pid = getpid();
     atomic_init(&logger->write_idx, 0);
     atomic_init(&logger->read_idx, 0);
     atomic_init(&logger->running, 1);
 
     if (filepath && strlen(filepath) > 0) {
-        logger->fd = open(filepath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        logger->fd = open(filepath, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
         logger->owns_fd = 1;
     } else {
         logger->fd = STDOUT_FILENO;
@@ -184,15 +228,21 @@ bt_logger_t *bt_logger_create(const char *filepath, size_t capacity) {
 
 bt_log_entry_t *bt_logger_acquire_slot(bt_logger_t *logger, uint8_t level,
                                        const char *msg, size_t msg_len) {
-    if (!logger || !atomic_load_explicit(&logger->running, memory_order_relaxed)) {
+    if (BT_UNLIKELY(!logger || !atomic_load_explicit(&logger->running, memory_order_relaxed))) {
         return NULL;
     }
 
+    if (BT_UNLIKELY(logger->owner_pid != getpid())) {
+        bt_logger_reinit_after_fork(logger);
+    }
+
     size_t w = atomic_load_explicit(&logger->write_idx, memory_order_relaxed);
-    if (w - logger->cached_read_idx >= logger->capacity) {
+
+    /* Fast path: check producer-local cached_read_idx first to avoid cross-core atomic load */
+    if (BT_UNLIKELY(w - logger->cached_read_idx >= logger->capacity)) {
         logger->cached_read_idx = atomic_load_explicit(&logger->read_idx, memory_order_acquire);
-        if (w - logger->cached_read_idx >= logger->capacity) {
-            /* Ring buffer full: drop log rather than blocking the event loop! */
+        if (BT_UNLIKELY(w - logger->cached_read_idx >= logger->capacity)) {
+            /* Ring buffer full: drop log rather than blocking the event loop */
             logger->dropped_count++;
             return NULL;
         }
@@ -204,7 +254,10 @@ bt_log_entry_t *bt_logger_acquire_slot(bt_logger_t *logger, uint8_t level,
     slot->num_kvs = 0;
 
     size_t copy_len = msg_len < (sizeof(slot->msg) - 1) ? msg_len : (sizeof(slot->msg) - 1);
-    memcpy(slot->msg, msg, copy_len);
+    if (copy_len > 0 && msg) {
+        /* Raw memcpy on the hot HTTP producer thread; consumer sanitizes when formatting */
+        memcpy(slot->msg, msg, copy_len);
+    }
     slot->msg[copy_len] = '\0';
     slot->msg_len = (uint8_t)copy_len;
 
@@ -266,7 +319,11 @@ void bt_logger_flush_and_stop(bt_logger_t *logger) {
     if (!logger) return;
     int expected = 1;
     if (atomic_compare_exchange_strong(&logger->running, &expected, 0)) {
-        pthread_join(logger->thread, NULL);
+        if (logger->owner_pid == getpid()) {
+            pthread_join(logger->thread, NULL);
+        } else {
+            drain_ring_buffer(logger);
+        }
         if (logger->owns_fd && logger->fd >= 0) {
             fsync(logger->fd);
             close(logger->fd);

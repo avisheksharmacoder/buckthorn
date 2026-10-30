@@ -62,6 +62,7 @@ cdef extern from "c_src/bt_arena.h" nogil:
         size_t offset
 
     int bt_arena_init(bt_arena_t *arena, size_t capacity)
+    void *bt_arena_alloc(bt_arena_t *arena, size_t size)
     void bt_arena_reset(bt_arena_t *arena)
     void bt_arena_destroy(bt_arena_t *arena)
 
@@ -83,6 +84,7 @@ cdef extern from "c_src/bt_params.h" nogil:
         BT_ERR_STR_MIN_LEN
         BT_ERR_STR_MAX_LEN
 
+    int bt_url_decode_slice(bt_slice_t *slice, int plus_as_space)
     int bt_find_query_param(const char *query, size_t query_len,
                             const char *key, size_t key_len, bt_slice_t *out_val)
     int bt_find_header(phr_header *headers, size_t num_headers,

@@ -1,9 +1,10 @@
-# buckthorn/cli.py
 import argparse
 import importlib
 import os
+import re
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 from buckthorn.compiler import transpile_module_to_pyx, compile_pyx_module
@@ -67,10 +68,10 @@ def _load_target_app(target: str) -> Any:
     if mod_name.endswith(".py"):
         mod_name = mod_name[:-3]
     mod_name = mod_name.replace("/", ".").replace("\\", ".").strip(".")
-    sys.path.insert(0, os.getcwd())
+    if os.getcwd() not in sys.path:
+        sys.path.insert(0, os.getcwd())
     mod = importlib.import_module(mod_name)
     return getattr(mod, app_attr)
-
 
 
 def build_command(args: argparse.Namespace) -> Path:
@@ -91,6 +92,108 @@ def build_command(args: argparse.Namespace) -> Path:
     return so_files[0]
 
 
+def _spawn_worker(target: str, host: str, port: int) -> int:
+    pid = os.fork()
+    if pid == 0:
+        app = _load_target_app(target)
+        app.run(host=host, port=port)
+        os._exit(0)
+    return pid
+_WATCH_EXTENSIONS = (".py", ".pyx", ".pxd", ".c", ".h")
+_IGNORE_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "dist_buckthorn",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+}
+
+
+def _snapshot_project_mtimes(root: Path) -> dict[str, int]:
+    mtimes: dict[str, int] = {}
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.name.startswith(".") and entry.name in _IGNORE_DIRS:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in _IGNORE_DIRS:
+                            stack.append(Path(entry.path))
+                    elif entry.name.endswith(_WATCH_EXTENSIONS):
+                        try:
+                            mtimes[entry.path] = entry.stat(follow_symlinks=False).st_mtime_ns
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    return mtimes
+
+
+def _diff_snapshots(prev: dict[str, int], curr: dict[str, int]) -> str | None:
+    for path, mtime in curr.items():
+        if prev.get(path) != mtime:
+            return os.path.relpath(path)
+    for path in prev:
+        if path not in curr:
+            return os.path.relpath(path)
+    return None
+
+
+def _terminate_worker_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(40):
+            done_pid, _ = os.waitpid(pid, os.WNOHANG)
+            if done_pid == pid:
+                return
+            time.sleep(0.025)
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+
+
+def _run_with_reloader(args: argparse.Namespace, watch_dir: Path | None = None) -> None:
+    root = (watch_dir or Path.cwd()).resolve()
+    snapshot = _snapshot_project_mtimes(root)
+    worker_pid = _spawn_worker(args.target, args.host, args.port)
+    shutting_down = False
+
+    def _sig_handler(signum: int, frame: Any) -> None:
+        nonlocal shutting_down
+        shutting_down = True
+        _terminate_worker_pid(worker_pid)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    print(f"[Buckthorn] 👀 Watching '{root}' for changes (target: {args.target} on {args.host}:{args.port})")
+    while not shutting_down:
+        time.sleep(0.25)
+        try:
+            dead_pid, _ = os.waitpid(worker_pid, os.WNOHANG)
+        except ChildProcessError:
+            dead_pid = worker_pid
+
+        new_snapshot = _snapshot_project_mtimes(root)
+        changed_file = _diff_snapshots(snapshot, new_snapshot)
+        if changed_file is not None:
+            print(f"[Buckthorn] 🔄 Change detected in '{changed_file}', reloading worker...")
+            snapshot = new_snapshot
+            if dead_pid == 0:
+                _terminate_worker_pid(worker_pid)
+            worker_pid = _spawn_worker(args.target, args.host, args.port)
+
+
 def run_command(args: argparse.Namespace) -> None:
     workers = max(1, int(getattr(args, "workers", 1)))
     if workers == 1:
@@ -98,19 +201,16 @@ def run_command(args: argparse.Namespace) -> None:
         app.run(host=args.host, port=args.port)
         return
 
-    pids: list[int] = []
+    pids: set[int] = set()
+    shutting_down = False
+
     for _ in range(workers):
-        pid = os.fork()
-        if pid == 0:
-            # Child worker binds to the same port via Linux kernel SO_REUSEPORT
-            app = _load_target_app(args.target)
-            app.run(host=args.host, port=args.port)
-            os._exit(0)
-        else:
-            pids.append(pid)
+        pids.add(_spawn_worker(args.target, args.host, args.port))
 
     def _sig_handler(signum: int, frame: Any) -> None:
-        for pid in pids:
+        nonlocal shutting_down
+        shutting_down = True
+        for pid in list(pids):
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
@@ -119,11 +219,22 @@ def run_command(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
-    for pid in pids:
+
+    while pids and not shutting_down:
         try:
-            os.waitpid(pid, 0)
+            dead_pid, status = os.waitpid(-1, 0)
+            pids.discard(dead_pid)
+            if not shutting_down and os.WIFSIGNALED(status):
+                # Respawn crashed worker to preserve SO_REUSEPORT pool capacity
+                pids.add(_spawn_worker(args.target, args.host, args.port))
         except ChildProcessError:
-            pass
+            break
+        except InterruptedError:
+            continue
+
+
+def _sanitize_http_token(val: str) -> str:
+    return re.sub(r"[\r\n\0\s]+", "", val)
 
 
 def bench_command(args: argparse.Namespace) -> None:
@@ -134,14 +245,17 @@ def bench_command(args: argparse.Namespace) -> None:
 
     app = _load_target_app(args.target)
     client = RawTestClient(app)
+    send_raw = client._client.send_raw
     iterations = max(100, int(args.iterations))
     speed_gate = int(getattr(args, "gate", 0))
 
     targets_to_run: list[tuple[str, str, bytes, Any]] = []
 
     if args.path:
-        method = args.method.upper()
-        path = args.path
+        method = _sanitize_http_token(args.method.upper())
+        path = _sanitize_http_token(args.path)
+        if not path.startswith("/"):
+            path = "/" + path
         body_bytes = args.body.encode("utf-8") if args.body else b""
         headers = b"Content-Type: application/json\r\n" if body_bytes else b""
         req = (
@@ -152,18 +266,15 @@ def bench_command(args: argparse.Namespace) -> None:
         ).encode("latin1") + body_bytes
         targets_to_run.append((method, path, req, None))
     else:
-        # Discover routes from app
         routes_list = getattr(app, "routes", [])
         for r in routes_list:
-            method = r.get("method", "GET")
+            method = _sanitize_http_token(r.get("method", "GET").upper())
             path = r.get("path", "/")
             endpoint = r.get("endpoint")
 
-            candidate_path = path
-            if "{" in candidate_path:
-                import re
-                candidate_path = re.sub(r"\{[a-zA-Z0-9_]+\}", "1", candidate_path)
-
+            candidate_path = _sanitize_http_token(
+                re.sub(r"\{[a-zA-Z0-9_:]+\}", "1", path)
+            )
             body_bytes = b"{}" if method in ("POST", "PUT", "PATCH") else b""
             headers = b"Content-Type: application/json\r\n" if body_bytes else b""
             req = (
@@ -173,16 +284,14 @@ def bench_command(args: argparse.Namespace) -> None:
                 f"Content-Length: {len(body_bytes)}\r\n\r\n"
             ).encode("latin1") + body_bytes
 
-            # Quick probe to see if route runs without complex authentication/data requirements
-            probe_res = client.send_raw(req)
+            probe_res = send_raw(req)
             if probe_res.status_code < 400:
                 targets_to_run.append((method, candidate_path, req, endpoint))
 
-        # Check documentation / built-in endpoints
         for extra in ["/health", "/docs", "/openapi.json"]:
             if not any(t[1] == extra for t in targets_to_run):
                 req = f"GET {extra} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode("latin1")
-                probe = client.send_raw(req)
+                probe = send_raw(req)
                 if probe.status_code == 200:
                     targets_to_run.append(("GET", extra, req, None))
 
@@ -204,29 +313,28 @@ def bench_command(args: argparse.Namespace) -> None:
     print(f"| {'Method & Path':<35} | {'Handler Type':<12} | {'Throughput':>15} | {'Avg Lat':>9} | {'p50 Lat':>9} | {'p99 Lat':>9} |{gate_hdr}")
     print("|" + "-" * 37 + "|" + "-" * 14 + "|" + "-" * 17 + "|" + "-" * 11 + "|" + "-" * 11 + "|" + "-" * 11 + "|" + gate_sep)
 
-    for method, path, req, endpoint in targets_to_run:
-        send_raw = client.send_raw
+    perf_counter = time.perf_counter
+    perf_counter_ns = time.perf_counter_ns
 
-        # 1. Warmup pass
+    for method, path, req, endpoint in targets_to_run:
         warmup_n = min(300, max(10, iterations // 10))
         for _ in range(warmup_n):
             send_raw(req)
 
-        # 2. De-biased Raw Throughput Pass (Zero measurement instrumentation in tight loop)
-        t0 = time.perf_counter()
+        # 1. Pure uninstrumented tight loop for accurate RPS throughput
+        t0 = perf_counter()
         for _ in range(iterations):
             send_raw(req)
-        total_time = time.perf_counter() - t0
+        total_time = perf_counter() - t0
         rps = iterations / total_time
 
-        # 3. Latency Distribution Sampling Pass (Fixed sample size to avoid degrading throughput)
-        sample_n = min(iterations, 2000)
-        latencies_us: list[float] = []
-        for _ in range(sample_n):
-            req_start = time.perf_counter_ns()
+        # 2. Dedicated latency sampling pass for p50 / p99 percentiles
+        sample_n = min(2000, iterations)
+        latencies_us = [0.0] * sample_n
+        for idx in range(sample_n):
+            req_start = perf_counter_ns()
             send_raw(req)
-            req_end = time.perf_counter_ns()
-            latencies_us.append((req_end - req_start) / 1000.0)
+            latencies_us[idx] = (perf_counter_ns() - req_start) * 0.001
 
         latencies_us.sort()
         avg_us = statistics.mean(latencies_us)
@@ -265,6 +373,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "build":
         so_path = build_command(args)
         print(f"[Buckthorn] Compiled production extension: {so_path}")
+    elif args.command == "dev" and getattr(args, "reload", False):
+        _run_with_reloader(args)
     elif args.command in ("dev", "run"):
         run_command(args)
     elif args.command == "bench":

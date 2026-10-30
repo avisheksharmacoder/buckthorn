@@ -145,12 +145,13 @@ def test_phase3_yyjson_schema_speed_gate():
         return prod
 
     client = RawTestClient(app)
+    body = b'{"sku":"BK-777","price":199.99,"qty":3,"in_stock":true,"tags":["a","b"]}'
     raw_req = (
         b"POST /bench/orders HTTP/1.1\r\n"
         b"Host: localhost\r\n"
         b"Content-Type: application/json\r\n"
-        b"Content-Length: 71\r\n\r\n"
-        b'{"sku":"BK-777","price":199.99,"qty":3,"in_stock":true,"tags":["a","b"]}'
+        + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        + body
     )
 
     for _ in range(500):
@@ -165,3 +166,56 @@ def test_phase3_yyjson_schema_speed_gate():
     rps = iterations / elapsed
     assert res.status_code == 200
     assert rps > 80_000, f"Expected >80,000 single-worker JSON Schema RPS, got {rps:,.0f} RPS"
+
+
+class ShippingAddress(Schema):
+    city: str = Field(min_length=2, max_length=64)
+    pincode: int = Field(ge=100000, le=999999)
+
+
+class LineItem(Schema):
+    sku: str = Field(min_length=3, max_length=32)
+    qty: int = Field(ge=1, le=100)
+    unit_price: float = Field(gt=0.0)
+
+
+class PurchaseOrder(Schema):
+    order_id: int = Field(ge=1)
+    address: ShippingAddress
+    items: list[LineItem]
+
+
+def test_nested_schema_and_list_of_schemas_roundtrip():
+    app = Buckthorn()
+
+    @app.post("/orders", response_model=PurchaseOrder)
+    def create_order(order: PurchaseOrder):
+        assert isinstance(order.address, ShippingAddress)
+        assert order.address.city == "Bengaluru"
+        assert len(order.items) == 2
+        assert isinstance(order.items[0], LineItem)
+        return order
+
+    with RawTestClient(app) as client:
+        # 1. Valid nested payload -> 200 OK
+        valid_payload = {
+            "order_id": 501,
+            "address": {"city": "Bengaluru", "pincode": 560001},
+            "items": [
+                {"sku": "CPU-99", "qty": 2, "unit_price": 450.5},
+                {"sku": "RAM-64", "qty": 4, "unit_price": 125.0},
+            ],
+        }
+        res_ok = client.post("/orders", json=valid_payload)
+        assert res_ok.status_code == 200
+        assert res_ok.json() == valid_payload
+
+        # 2. Invalid child field inside nested list[LineItem] (qty=0 < ge=1) -> 422
+        bad_item_payload = {
+            "order_id": 501,
+            "address": {"city": "Bengaluru", "pincode": 560001},
+            "items": [{"sku": "CPU-99", "qty": 0, "unit_price": 450.5}],
+        }
+        res_422 = client.post("/orders", json=bad_item_payload)
+        assert res_422.status_code == 422
+

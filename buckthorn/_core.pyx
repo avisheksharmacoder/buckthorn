@@ -1,8 +1,8 @@
-# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, initializedcheck=False, infer_types=True
 cimport cython
 from libc.string cimport memcpy
 from libc.stdio cimport snprintf
-from libc.stdint cimport int64_t, uint32_t, uintptr_t
+from libc.stdint cimport int64_t, uint8_t, uint32_t, uintptr_t
 from cpython.ref cimport PyObject
 from cpython.bytes cimport PyBytes_AsStringAndSize, PyBytes_FromStringAndSize
 from cpython.bytearray cimport PyByteArray_AsString
@@ -25,7 +25,7 @@ from buckthorn._core cimport (
     bt_find_query_param, bt_find_header, bt_find_cookie,
     bt_parse_int64_checked, bt_parse_double_checked, bt_validate_str_checked,
     yyjson_val, yyjson_mut_doc, yyjson_mut_val,
-    yyjson_is_null, yyjson_is_bool, yyjson_is_int, yyjson_is_num, yyjson_is_str, yyjson_is_arr,
+    yyjson_is_null, yyjson_is_bool, yyjson_is_int, yyjson_is_num, yyjson_is_str, yyjson_is_arr, yyjson_is_obj,
     yyjson_get_bool, yyjson_get_sint, yyjson_get_num, yyjson_get_str, yyjson_get_len,
     yyjson_arr_get_first,
     yyjson_mut_arr, yyjson_mut_obj, yyjson_mut_sint, yyjson_mut_real,
@@ -60,20 +60,29 @@ from buckthorn._core cimport (
     bt_multipart_extract_file,
     bt_router_set_max_body_size,
     bt_sanitize_header_str,
-    yyjson_arr_iter, yyjson_obj_iter_init, yyjson_obj_iter_next, yyjson_obj_iter_get_val,
+    yyjson_obj_iter, yyjson_arr_iter,
+    yyjson_obj_iter_init, yyjson_obj_iter_next, yyjson_obj_iter_get_val,
     yyjson_arr_iter_init, yyjson_arr_iter_next,
-    PyIter_Send, PySendResult, PYGEN_RETURN, PYGEN_ERROR, PYGEN_NEXT, PyUnicode_InternInPlace,
-    Py_DECREF_ptr, PyCoro_CheckExact
+    PyIter_Send, PySendResult, PYGEN_RETURN, PYGEN_ERROR, PYGEN_NEXT,
+    PyUnicode_InternInPlace, Py_DECREF_ptr, PyCoro_CheckExact
 )
 
+cdef extern from "c_vendor/yyjson.h" nogil:
+    yyjson_val *unsafe_yyjson_get_first(yyjson_val *ctn)
+    yyjson_val *unsafe_yyjson_get_next(yyjson_val *val)
+
+# Arena Output Buffer Capacities
+DEF BT_MAX_HANDLER_BODY_CAP = 32768
+DEF BT_MAX_EXTRA_HDRS_CAP   = 2048
+
 # Parameter Source Constants
-DEF SRC_PATH        = 1
-DEF SRC_QUERY       = 2
-DEF SRC_HEADER      = 3
-DEF SRC_COOKIE      = 4
-DEF SRC_REQUEST     = 5
-DEF SRC_BODY_SCHEMA = 6
-DEF SRC_DEPENDS     = 7
+DEF SRC_PATH             = 1
+DEF SRC_QUERY            = 2
+DEF SRC_HEADER           = 3
+DEF SRC_COOKIE           = 4
+DEF SRC_REQUEST          = 5
+DEF SRC_BODY_SCHEMA      = 6
+DEF SRC_DEPENDS          = 7
 DEF SRC_SECURITY         = 8
 DEF SRC_UPLOAD_FILE      = 9
 DEF SRC_BACKGROUND_TASKS = 10
@@ -128,7 +137,7 @@ cdef int _PENDING_ASYNC_TASKS = 0
 
 cdef inline object _get_or_create_async_loop():
     global _SHARED_ASYNC_LOOP, _LOOP_READY
-    if not _LOOP_READY or _SHARED_ASYNC_LOOP is None or _SHARED_ASYNC_LOOP.is_closed():
+    if not _LOOP_READY or _SHARED_ASYNC_LOOP is None:
         if _HAS_UVLOOP:
             _SHARED_ASYNC_LOOP = uvloop.new_event_loop()
         else:
@@ -142,12 +151,18 @@ cdef inline object _get_or_create_async_loop():
         _LOOP_READY = True
     return _SHARED_ASYNC_LOOP
 
+
 cdef object _drive_coro(object coro, object initial_fut, object loop):
     cdef object completion_fut = loop.create_future()
-    try:
-        setattr(initial_fut, "_asyncio_future_blocking", False)
-    except Exception:
-        pass
+    cdef object cur_fut = initial_fut
+    if cur_fut is None or not hasattr(cur_fut, "add_done_callback"):
+        cur_fut = loop.create_future()
+        loop.call_soon(cur_fut.set_result, None)
+    else:
+        try:
+            setattr(cur_fut, "_asyncio_future_blocking", False)
+        except Exception:
+            pass
 
     def on_fut_done(fut):
         cdef object prev_loop = events._get_running_loop()
@@ -155,15 +170,19 @@ cdef object _drive_coro(object coro, object initial_fut, object loop):
             events._set_running_loop(loop)
         cdef object next_fut, exc
         try:
-            exc = fut.exception()
+            exc = fut.exception() if fut is not None else None
             if exc is not None:
                 next_fut = coro.throw(exc)
             else:
-                next_fut = coro.send(fut.result())
-            try:
-                setattr(next_fut, "_asyncio_future_blocking", False)
-            except Exception:
-                pass
+                next_fut = coro.send(fut.result() if fut is not None else None)
+            if next_fut is None or not hasattr(next_fut, "add_done_callback"):
+                next_fut = loop.create_future()
+                loop.call_soon(next_fut.set_result, None)
+            else:
+                try:
+                    setattr(next_fut, "_asyncio_future_blocking", False)
+                except Exception:
+                    pass
             next_fut.add_done_callback(on_fut_done)
         except StopIteration as stop:
             if not completion_fut.done():
@@ -175,156 +194,158 @@ cdef object _drive_coro(object coro, object initial_fut, object loop):
             if prev_loop is None:
                 events._set_running_loop(None)
 
-    initial_fut.add_done_callback(on_fut_done)
+    cur_fut.add_done_callback(on_fut_done)
     return completion_fut
 
-cdef inline object _step_coroutine_sync(object coro):
+
+cpdef inline object _step_coroutine_sync(object coro):
     """
-    Tier-1 Eager Fast Path via PyIter_Send + Tier-2 Event Loop Fallback for synchronous callers (RawTestClient):
-    1. Steps `PyIter_Send(coro, None, &res_ptr)` eagerly with zero StopIteration exception allocation.
-    2. If PYGEN_RETURN (eager completion), returns value directly in ~15-20ns.
-    3. If PYGEN_NEXT (suspended on real I/O), drives `_drive_coro` on uvloop/asyncio until completion.
+    Tier-1 Eager Fast Path using CPython 3.11+ PyIter_Send (zero StopIteration allocation)
+    + Tier-2 Event Loop Fallback when an incomplete Future/awaitable is yielded.
     """
-    cdef PyObject *res_ptr = NULL
     cdef object loop = _get_or_create_async_loop()
     cdef object prev_loop = events._get_running_loop()
     if prev_loop is None:
         events._set_running_loop(loop)
+
+    cdef PyObject *res_ptr = NULL
     cdef PySendResult send_rc
+    cdef object first_yielded
     try:
         send_rc = PyIter_Send(coro, None, &res_ptr)
-    except StopIteration as stop:
-        coro.close()
-        return stop.value
-    except BaseException:
-        coro.close()
-        raise
+        if send_rc == PYGEN_RETURN:
+            first_yielded = <object>res_ptr
+            Py_DECREF_ptr(res_ptr)
+            return first_yielded
+        elif send_rc == PYGEN_ERROR:
+            coro.close()
+            raise
+        first_yielded = <object>res_ptr
+        Py_DECREF_ptr(res_ptr)
     finally:
         if prev_loop is None:
             events._set_running_loop(None)
 
-    cdef object val
-    if send_rc == PYGEN_RETURN:
-        val = <object>res_ptr
-        Py_DECREF_ptr(res_ptr)
-        coro.close()
-        return val
-    elif send_rc == PYGEN_ERROR:
-        coro.close()
-        raise
-
-    cdef object first_yielded = <object>res_ptr
-    Py_DECREF_ptr(res_ptr)
     cdef object completion_fut = _drive_coro(coro, first_yielded, loop)
     try:
         return loop.run_until_complete(completion_fut)
     finally:
         coro.close()
 
+
 async def _step_coroutine_async(object coro, object loop):
-    """
-    Asynchronous coroutine driver for execution contexts inside an already-running event loop.
-    Avoids calling loop.run_until_complete() reentrantly when loop.is_running() is True.
-    Uses PyIter_Send for zero-allocation eager stepping.
-    """
+    """Asynchronous coroutine driver for execution contexts inside a running event loop."""
     cdef object prev_loop = events._get_running_loop()
     if prev_loop is None:
         events._set_running_loop(loop)
+
     cdef PyObject *res_ptr = NULL
     cdef PySendResult send_rc
+    cdef object first_yielded
     try:
         send_rc = PyIter_Send(coro, None, &res_ptr)
-    except StopIteration as stop:
-        coro.close()
-        return stop.value
-    except BaseException:
-        coro.close()
-        raise
+        if send_rc == PYGEN_RETURN:
+            first_yielded = <object>res_ptr
+            Py_DECREF_ptr(res_ptr)
+            return first_yielded
+        elif send_rc == PYGEN_ERROR:
+            coro.close()
+            raise
+        first_yielded = <object>res_ptr
+        Py_DECREF_ptr(res_ptr)
     finally:
         if prev_loop is None:
             events._set_running_loop(None)
 
-    cdef object val
-    if send_rc == PYGEN_RETURN:
-        val = <object>res_ptr
-        Py_DECREF_ptr(res_ptr)
-        coro.close()
-        return val
-    elif send_rc == PYGEN_ERROR:
-        coro.close()
-        raise
-
-    cdef object first_yielded = <object>res_ptr
-    Py_DECREF_ptr(res_ptr)
     cdef object completion_fut = _drive_coro(coro, first_yielded, loop)
     try:
         return await completion_fut
     finally:
         coro.close()
 
+
 cdef int _cython_async_loop_tick() noexcept with gil:
     global _PENDING_ASYNC_TASKS, _SHARED_ASYNC_LOOP
     if _PENDING_ASYNC_TASKS <= 0 or _SHARED_ASYNC_LOOP is None:
         return 0
     try:
-        # Run one non-blocking iteration of the Python event loop
         _SHARED_ASYNC_LOOP.call_soon(_SHARED_ASYNC_LOOP.stop)
         _SHARED_ASYNC_LOOP.run_forever()
     except Exception:
         pass
     return _PENDING_ASYNC_TASKS
 
-cdef void _complete_suspended_coro(
+
+cdef inline int _safe_copy_to_body_buf(
+    const char *src,
+    Py_ssize_t src_len,
+    char *out_body_buf,
+    size_t *out_body_len
+) noexcept nogil:
+    if src_len < 0 or <size_t>src_len > BT_MAX_HANDLER_BODY_CAP:
+        return -1
+    if src_len > 0 and src != NULL:
+        memcpy(out_body_buf, src, <size_t>src_len)
+    out_body_len[0] = <size_t>src_len
+    return 0
+
+
+cdef void _flush_suspended_tcp_coro(
     uintptr_t client_addr,
     RouteEntry entry,
     object result,
-    int status_code,
-    bint is_error
+    object caught_exc
 ):
+    """Synchronous C stack helper so 34KB wire buffers are not stored inside heap coroutine frames."""
     cdef char body_buf[32768]
     cdef size_t body_len = 0
     cdef char extra_hdrs[2048]
     cdef size_t extra_hdrs_len = 0
+    cdef int status_code = entry.default_status_code
     cdef char *raw_ptr = NULL
     cdef Py_ssize_t raw_len = 0
-    cdef object spec_attr
+    cdef object schema_spec_attr
 
-    if is_error:
-        memcpy(body_buf, b"Internal Server Error", 21)
-        body_len = 21
-    elif isinstance(result, HTTPException):
-        status_code = result.status_code
-        _serialize_http_exception(result.detail, body_buf, &body_len)
-    else:
-        if entry.response_schema_spec is not None:
-            _serialize_schema_to_c_buf(result, entry.response_schema_spec, body_buf, &body_len)
-        elif isinstance(result, dict):
-            _serialize_dict_to_c_buf(<dict>result, body_buf, &body_len)
-        elif isinstance(result, bytes):
-            PyBytes_AsStringAndSize(result, &raw_ptr, &raw_len)
-            if <size_t>raw_len > 32768:
-                raw_len = 32768
-            memcpy(body_buf, raw_ptr, <size_t>raw_len)
-            body_len = <size_t>raw_len
-        elif isinstance(result, str):
-            raw_ptr = <char *>PyUnicode_AsUTF8AndSize(result, &raw_len)
-            if raw_ptr != NULL:
-                if <size_t>raw_len > 32768:
-                    raw_len = 32768
-                memcpy(body_buf, raw_ptr, <size_t>raw_len)
-                body_len = <size_t>raw_len
+    if caught_exc is not None:
+        if isinstance(caught_exc, HTTPException):
+            status_code = <int>caught_exc.status_code
+            _serialize_http_exception(caught_exc.detail, body_buf, &body_len)
         else:
-            spec_attr = getattr(result, "__bt_schema_spec__", None)
-            if spec_attr is not None:
-                _serialize_schema_to_c_buf(result, <CompiledSchemaSpec>spec_attr, body_buf, &body_len)
+            status_code = 500
+            memcpy(body_buf, b"Internal Server Error", 21)
+            body_len = 21
+    else:
+        try:
+            if entry.response_schema_spec is not None:
+                if _serialize_schema_to_c_buf(result, entry.response_schema_spec, body_buf, &body_len) != 0:
+                    status_code = 500
+            elif isinstance(result, dict):
+                if _serialize_dict_to_c_buf(<dict>result, body_buf, &body_len) != 0:
+                    status_code = 500
+            elif isinstance(result, bytes):
+                PyBytes_AsStringAndSize(result, &raw_ptr, &raw_len)
+                if _safe_copy_to_body_buf(raw_ptr, raw_len, body_buf, &body_len) != 0:
+                    status_code = 500
+            elif isinstance(result, str):
+                raw_ptr = <char *>PyUnicode_AsUTF8AndSize(result, &raw_len)
+                if _safe_copy_to_body_buf(raw_ptr, raw_len, body_buf, &body_len) != 0:
+                    status_code = 500
             else:
-                memcpy(body_buf, b"Internal Server Error", 21)
-                body_len = 21
-                status_code = 500
+                schema_spec_attr = getattr(result, "__bt_schema_spec__", None)
+                if schema_spec_attr is not None:
+                    if _serialize_schema_to_c_buf(
+                        result, <CompiledSchemaSpec>schema_spec_attr, body_buf, &body_len
+                    ) != 0:
+                        status_code = 500
+        except Exception:
+            status_code = 500
+            memcpy(body_buf, b"Internal Server Error", 21)
+            body_len = 21
 
     bt_uv_complete_async_request(
         <void *>client_addr, body_buf, body_len, extra_hdrs, extra_hdrs_len, status_code
     )
+
 
 cdef void _schedule_suspended_tcp_coro(
     object coro,
@@ -341,29 +362,25 @@ cdef void _schedule_suspended_tcp_coro(
 
     async def _drive_and_flush():
         global _PENDING_ASYNC_TASKS
-        cdef int status_code = entry.default_status_code
         cdef BackgroundTasks bg_runner
-        cdef object result = None, completion_fut = None
-        cdef bint is_error = False
+        cdef object result = None, caught_exc = None, completion_fut = None
+        cdef bint is_ok = True
 
         try:
             completion_fut = _drive_coro(coro, first_yielded, loop)
             result = await completion_fut
-        except HTTPException as http_exc:
-            result = http_exc
-            status_code = <int>http_exc.status_code
-        except Exception:
-            status_code = 500
-            is_error = True
+        except BaseException as exc:
+            caught_exc = exc
+            is_ok = False
         finally:
             coro.close()
             if teardown_stack is not None and len(teardown_stack) > 0:
                 await _teardown_generators_async(teardown_stack, loop)
-            if bg_tasks_list is not None and len(bg_tasks_list) > 0 and status_code < 400:
+            if bg_tasks_list is not None and len(bg_tasks_list) > 0 and is_ok:
                 for bg_runner in bg_tasks_list:
                     await bg_runner._execute_all_async(loop)
             _PENDING_ASYNC_TASKS -= 1
-            _complete_suspended_coro(client_addr, entry, result, status_code, is_error)
+            _flush_suspended_tcp_coro(client_addr, entry, result, caught_exc)
 
     loop.create_task(_drive_and_flush())
 
@@ -488,8 +505,6 @@ cdef class WebSocket:
     cdef public str accept_key
     cdef public list _in_frames
     cdef public list _out_frames
-    cdef size_t _in_idx
-    cdef size_t _out_idx
     cdef public dict _pubsub_registry_ref
 
     def __cinit__(self, str path="", dict pubsub_registry=None):
@@ -499,8 +514,6 @@ cdef class WebSocket:
         self.accept_key = ""
         self._in_frames = []
         self._out_frames = []
-        self._in_idx = 0
-        self._out_idx = 0
         self._pubsub_registry_ref = pubsub_registry
 
     cpdef str compute_handshake(self, str sec_websocket_key):
@@ -547,14 +560,9 @@ cdef class WebSocket:
         self._in_frames.append(text)
 
     async def receive_text(self) -> str:
-        if self._in_idx >= len(self._in_frames):
+        if not self._in_frames:
             raise RuntimeError("No WebSocket frame available")
-        cdef str msg = self._in_frames[self._in_idx]
-        self._in_idx += 1
-        if self._in_idx == len(self._in_frames) and self._in_idx > 64:
-            self._in_frames.clear()
-            self._in_idx = 0
-        return msg
+        return self._in_frames.pop(0)
 
     cpdef bytes _encode_server_frame(self, str text):
         cdef Py_ssize_t s_len = 0
@@ -572,13 +580,9 @@ cdef class WebSocket:
         self._out_frames.append(encoded_frame)
 
     cpdef str pop_outgoing_text(self):
-        if self._out_idx >= len(self._out_frames):
+        if not self._out_frames:
             raise RuntimeError("No outgoing WebSocket frame")
-        cdef bytes raw = self._out_frames[self._out_idx]
-        self._out_idx += 1
-        if self._out_idx == len(self._out_frames) and self._out_idx > 64:
-            self._out_frames.clear()
-            self._out_idx = 0
+        cdef bytes raw = self._out_frames.pop(0)
         cdef char stack_buf[4096]
         cdef char *buf_ptr = NULL
         cdef Py_ssize_t raw_len = 0
@@ -648,8 +652,7 @@ cdef class BackgroundTasks:
         self._tasks = []
 
     def add_task(self, object func, *args, **kwargs):
-        cdef bint has_kwargs = bool(kwargs)
-        self._tasks.append((func, args, kwargs if has_kwargs else None))
+        self._tasks.append((func, args, kwargs if kwargs else None))
 
     cpdef void _execute_all(self):
         cdef tuple task_entry
@@ -658,7 +661,10 @@ cdef class BackgroundTasks:
             fn = task_entry[0]
             args = task_entry[1]
             kwargs = task_entry[2]
-            res = fn(*args) if kwargs is None else fn(*args, **kwargs)
+            if kwargs is None:
+                res = fn(*args)
+            else:
+                res = fn(*args, **kwargs)
             if PyCoro_CheckExact(res) or inspect.iscoroutine(res):
                 _step_coroutine_sync(res)
 
@@ -669,7 +675,10 @@ cdef class BackgroundTasks:
             fn = task_entry[0]
             args = task_entry[1]
             kwargs = task_entry[2]
-            res = fn(*args) if kwargs is None else fn(*args, **kwargs)
+            if kwargs is None:
+                res = fn(*args)
+            else:
+                res = fn(*args, **kwargs)
             if PyCoro_CheckExact(res) or inspect.iscoroutine(res):
                 await _step_coroutine_async(res, loop)
 
@@ -746,6 +755,17 @@ cdef class CompiledSecuritySpec:
                 self._num_scopes += 1
 
 
+cdef class CompiledSchemaSpec:
+    cdef public object schema_cls
+    cdef public tuple fields
+    cdef public int num_fields
+
+    def __cinit__(self, object schema_cls, list fields):
+        self.schema_cls = schema_cls
+        self.fields = tuple(fields)
+        self.num_fields = len(fields)
+
+
 cdef class CompiledFieldSpec:
     cdef public str name
     cdef public bytes b_name
@@ -755,6 +775,7 @@ cdef class CompiledFieldSpec:
     cdef public bint required
     cdef public object default_val
     cdef public bint is_list_default
+    cdef public CompiledSchemaSpec sub_schema
 
     cdef public bint has_ge
     cdef public int64_t int_ge
@@ -789,6 +810,7 @@ cdef class CompiledFieldSpec:
         object lt=None,
         object min_length=None,
         object max_length=None,
+        CompiledSchemaSpec sub_schema=None,
     ):
         cdef PyObject *o_name = <PyObject *>name
         PyUnicode_InternInPlace(&o_name)
@@ -804,6 +826,7 @@ cdef class CompiledFieldSpec:
         self.required = required
         self.default_val = default_val
         self.is_list_default = isinstance(default_val, list)
+        self.sub_schema = sub_schema
 
         self.has_ge = ge is not None
         if self.has_ge:
@@ -834,24 +857,13 @@ cdef class CompiledFieldSpec:
             self.max_len = <size_t>int(max_length)
 
 
-cdef class CompiledSchemaSpec:
-    cdef public object schema_cls
-    cdef public tuple fields
-    cdef public int num_fields
-
-    def __cinit__(self, object schema_cls, list fields):
-        self.schema_cls = schema_cls
-        self.fields = tuple(fields)
-        self.num_fields = len(fields)
-
-
 cdef class CompiledParamSpec:
     cdef public str arg_name
     cdef public bytes lookup_key
     cdef const char *_key_ptr
     cdef size_t _key_len
-    cdef public int source       # SRC_PATH..SRC_DEPENDS
-    cdef public int param_type   # TYPE_INT..TYPE_DEPENDS
+    cdef public int source       # SRC_PATH..SRC_BACKGROUND_TASKS
+    cdef public int param_type   # TYPE_INT..TYPE_BACKGROUND_TASKS
     cdef public int path_index
     cdef public int dep_slot_index
     cdef public bint required
@@ -967,22 +979,12 @@ cdef class CompiledDepStep:
 cdef class MiddlewareResponse:
     cdef public int status_code
     cdef public bytes body
-    cdef dict _headers
+    cdef public dict headers
 
     def __cinit__(self, int status_code=200, bytes body=b"", dict headers=None):
         self.status_code = status_code
         self.body = body
-        self._headers = headers
-
-    @property
-    def headers(self) -> dict:
-        if self._headers is None:
-            self._headers = {}
-        return self._headers
-
-    @headers.setter
-    def headers(self, dict val):
-        self._headers = val
+        self.headers = headers if headers is not None else {}
 
 
 cdef class RouteEntry:
@@ -1019,14 +1021,15 @@ cdef class RouteEntry:
 
         self.has_bg_tasks = False
         cdef CompiledParamSpec p_spec
-        for p in param_specs:
-            if (<CompiledParamSpec>p).source == SRC_BACKGROUND_TASKS:
+        cdef CompiledDepStep d_step
+        for p_spec in param_specs or []:
+            if p_spec.source == SRC_BACKGROUND_TASKS:
                 self.has_bg_tasks = True
                 break
-        if not self.has_bg_tasks and dep_steps is not None:
-            for step in dep_steps:
-                for p in (<CompiledDepStep>step).param_specs:
-                    if (<CompiledParamSpec>p).source == SRC_BACKGROUND_TASKS:
+        if not self.has_bg_tasks and dep_steps:
+            for d_step in dep_steps:
+                for p_spec in d_step.param_specs:
+                    if p_spec.source == SRC_BACKGROUND_TASKS:
                         self.has_bg_tasks = True
                         break
                 if self.has_bg_tasks:
@@ -1052,14 +1055,20 @@ cdef inline void _write_422_error(
 
     cdef int written = snprintf(
         out_body_buf, 1024,
-        '{"detail":[{"loc":["%s","%s"],"msg":"validation_error","type":"value_error"}]}',
+        '{"detail":[{"loc":["%s","%.128s"],"msg":"validation_error","type":"value_error"}]}',
         loc, key_ptr
     )
+    if written < 0:
+        written = 0
+    elif written >= 1024:
+        written = 1023
     out_body_len[0] = <size_t>written
     out_status_code[0] = 422
 
 
-cdef object _yyjson_val_to_py(yyjson_val *val):
+cdef object _yyjson_val_to_py(yyjson_val *val, int depth=0):
+    if depth > 32:
+        raise ValueError("JSON nesting depth limit (32) exceeded")
     if val == NULL or yyjson_is_null(val):
         return None
     elif yyjson_is_bool(val):
@@ -1071,12 +1080,16 @@ cdef object _yyjson_val_to_py(yyjson_val *val):
     elif yyjson_is_str(val):
         return PyUnicode_DecodeUTF8(yyjson_get_str(val), <Py_ssize_t>yyjson_get_len(val), "strict")
     elif yyjson_is_arr(val):
-        return _yyjson_arr_to_list(val)
+        return _yyjson_arr_to_list(val, depth + 1)
     elif yyjson_is_obj(val):
-        return _yyjson_obj_to_dict(val)
+        return _yyjson_obj_to_dict(val, depth + 1)
     return None
 
-cdef dict _yyjson_obj_to_dict(yyjson_val *obj):
+
+cdef dict _yyjson_obj_to_dict(yyjson_val *obj, int depth=0):
+    """Converts a C yyjson object directly to a Python dict (eliminates Python json.loads)."""
+    if depth > 32:
+        raise ValueError("JSON nesting depth limit (32) exceeded")
     cdef dict res = {}
     if obj == NULL:
         return res
@@ -1092,11 +1105,14 @@ cdef dict _yyjson_obj_to_dict(yyjson_val *obj):
             break
         val = yyjson_obj_iter_get_val(key)
         py_key = PyUnicode_DecodeUTF8(yyjson_get_str(key), <Py_ssize_t>yyjson_get_len(key), "strict")
-        py_val = _yyjson_val_to_py(val)
+        py_val = _yyjson_val_to_py(val, depth + 1)
         res[py_key] = py_val
     return res
 
-cdef list _yyjson_arr_to_list(yyjson_val *arr):
+
+cdef list _yyjson_arr_to_list(yyjson_val *arr, int depth=0):
+    if depth > 32:
+        raise ValueError("JSON nesting depth limit (32) exceeded")
     cdef list res = []
     if arr == NULL:
         return res
@@ -1108,24 +1124,24 @@ cdef list _yyjson_arr_to_list(yyjson_val *arr):
         elem = yyjson_arr_iter_next(&iter)
         if elem == NULL:
             break
-        res.append(_yyjson_val_to_py(elem))
+        res.append(_yyjson_val_to_py(elem, depth + 1))
     return res
 
-cdef list _parse_yyjson_array(yyjson_val *arr_val):
-    return _yyjson_arr_to_list(arr_val)
+
+cdef list _parse_yyjson_array(yyjson_val *arr_val, int depth=0):
+    return _yyjson_arr_to_list(arr_val, depth)
 
 
-cdef object _deserialize_schema_from_c_json(
+cdef object _deserialize_schema_from_jdoc(
     CompiledSchemaSpec schema_spec,
-    const char *body_ptr,
-    size_t body_len,
+    bt_json_doc_t *jdoc,
     char *out_body_buf,
     size_t *out_body_len,
-    int *out_status_code
+    int *out_status_code,
+    int depth
 ):
-    cdef bt_json_doc_t jdoc
-    if bt_json_parse_obj(body_ptr, body_len, &jdoc) != 0:
-        _write_422_error(SRC_BODY_SCHEMA, "__root__", out_body_buf, out_body_len, out_status_code)
+    if depth > 16:
+        _write_422_error(SRC_BODY_SCHEMA, "__depth__", out_body_buf, out_body_len, out_status_code)
         return None
 
     cdef object instance = (<type>(schema_spec.schema_cls)).__new__(<type>(schema_spec.schema_cls))
@@ -1139,7 +1155,11 @@ cdef object _deserialize_schema_from_c_json(
     cdef const char *v_str = NULL
     cdef size_t v_str_len = 0
     cdef yyjson_val *raw_val = NULL
-    cdef object py_val
+    cdef yyjson_val *elem = NULL
+    cdef size_t arr_n = 0, arr_idx = 0
+    cdef list sub_list
+    cdef bt_json_doc_t sub_doc
+    cdef object py_val, sub_inst
 
     for i in range(schema_spec.num_fields):
         fspec = <CompiledFieldSpec>(schema_spec.fields[i])
@@ -1147,7 +1167,7 @@ cdef object _deserialize_schema_from_c_json(
 
         if fspec.field_type == TYPE_INT:
             err = bt_json_get_int64_checked(
-                &jdoc, fspec._key_ptr, fspec._key_len,
+                jdoc, fspec._key_ptr, fspec._key_len,
                 fspec.has_ge, fspec.int_ge,
                 fspec.has_le, fspec.int_le,
                 fspec.has_gt, fspec.int_gt,
@@ -1163,7 +1183,7 @@ cdef object _deserialize_schema_from_c_json(
 
         elif fspec.field_type == TYPE_FLOAT:
             err = bt_json_get_double_checked(
-                &jdoc, fspec._key_ptr, fspec._key_len,
+                jdoc, fspec._key_ptr, fspec._key_len,
                 fspec.has_ge, fspec.float_ge,
                 fspec.has_le, fspec.float_le,
                 fspec.has_gt, fspec.float_gt,
@@ -1178,7 +1198,7 @@ cdef object _deserialize_schema_from_c_json(
                 continue
 
         elif fspec.field_type == TYPE_BOOL:
-            err = bt_json_get_bool_checked(&jdoc, fspec._key_ptr, fspec._key_len, &found, &v_bool)
+            err = bt_json_get_bool_checked(jdoc, fspec._key_ptr, fspec._key_len, &found, &v_bool)
             if err != BT_ERR_NONE:
                 _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
                 return None
@@ -1188,7 +1208,7 @@ cdef object _deserialize_schema_from_c_json(
 
         elif fspec.field_type == TYPE_STR:
             err = bt_json_get_str_checked(
-                &jdoc, fspec._key_ptr, fspec._key_len,
+                jdoc, fspec._key_ptr, fspec._key_len,
                 fspec.has_min_len, fspec.min_len,
                 fspec.has_max_len, fspec.max_len,
                 &found, &v_str, &v_str_len
@@ -1201,13 +1221,51 @@ cdef object _deserialize_schema_from_c_json(
                 PyObject_SetAttr(instance, fspec.name, py_val)
                 continue
 
+        elif fspec.field_type == TYPE_SCHEMA:
+            raw_val = bt_json_get_raw_field(jdoc, fspec._key_ptr, fspec._key_len, &found)
+            if found:
+                if not yyjson_is_obj(raw_val) or fspec.sub_schema is None:
+                    _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
+                    return None
+                sub_doc.doc = jdoc.doc
+                sub_doc.root = raw_val
+                sub_inst = _deserialize_schema_from_jdoc(
+                    fspec.sub_schema, &sub_doc, out_body_buf, out_body_len, out_status_code, depth + 1
+                )
+                if sub_inst is None:
+                    return None
+                PyObject_SetAttr(instance, fspec.name, sub_inst)
+                continue
+
         elif fspec.field_type == TYPE_LIST:
-            raw_val = bt_json_get_raw_field(&jdoc, fspec._key_ptr, fspec._key_len, &found)
+            raw_val = bt_json_get_raw_field(jdoc, fspec._key_ptr, fspec._key_len, &found)
             if found:
                 if not yyjson_is_arr(raw_val):
                     _write_422_error(SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code)
                     return None
-                PyObject_SetAttr(instance, fspec.name, _parse_yyjson_array(raw_val))
+                if fspec.sub_schema is not None:
+                    arr_n = yyjson_get_len(raw_val)
+                    sub_list = []
+                    if arr_n > 0:
+                        elem = yyjson_arr_get_first(raw_val)
+                        for arr_idx in range(arr_n):
+                            if not yyjson_is_obj(elem):
+                                _write_422_error(
+                                    SRC_BODY_SCHEMA, fspec._key_ptr, out_body_buf, out_body_len, out_status_code
+                                )
+                                return None
+                            sub_doc.doc = jdoc.doc
+                            sub_doc.root = elem
+                            sub_inst = _deserialize_schema_from_jdoc(
+                                fspec.sub_schema, &sub_doc, out_body_buf, out_body_len, out_status_code, depth + 1
+                            )
+                            if sub_inst is None:
+                                return None
+                            sub_list.append(sub_inst)
+                            elem = unsafe_yyjson_get_next(elem)
+                    PyObject_SetAttr(instance, fspec.name, sub_list)
+                else:
+                    PyObject_SetAttr(instance, fspec.name, _parse_yyjson_array(raw_val))
                 continue
 
         if fspec.required:
@@ -1221,43 +1279,111 @@ cdef object _deserialize_schema_from_c_json(
     return instance
 
 
-cdef yyjson_mut_val *_py_val_to_yyjson_mut(yyjson_mut_doc *doc, object val):
+cdef object _deserialize_schema_from_c_json(
+    CompiledSchemaSpec schema_spec,
+    const char *body_ptr,
+    size_t body_len,
+    char *out_body_buf,
+    size_t *out_body_len,
+    int *out_status_code
+):
+    cdef bt_json_doc_t jdoc
+    if bt_json_parse_obj(body_ptr, body_len, &jdoc) != 0:
+        _write_422_error(SRC_BODY_SCHEMA, "__root__", out_body_buf, out_body_len, out_status_code)
+        return None
+    return _deserialize_schema_from_jdoc(
+        schema_spec, &jdoc, out_body_buf, out_body_len, out_status_code, 0
+    )
+
+
+cdef yyjson_mut_val *_build_schema_mut_obj(
+    yyjson_mut_doc *doc,
+    object obj,
+    CompiledSchemaSpec schema_spec,
+    int depth
+):
+    if depth > 16 or obj is None:
+        return yyjson_mut_null(doc)
+
+    cdef yyjson_mut_val *obj_node = yyjson_mut_obj(doc)
+    cdef int i
+    cdef CompiledFieldSpec fspec
+    cdef object val
+    cdef bint is_dict = isinstance(obj, dict)
+    cdef yyjson_mut_val *k_node
+    cdef yyjson_mut_val *v_node
+
+    for i in range(schema_spec.num_fields):
+        fspec = <CompiledFieldSpec>(schema_spec.fields[i])
+        if is_dict:
+            val = (<dict>obj).get(fspec.name, fspec.default_val)
+        else:
+            val = PyObject_GetAttr(obj, fspec.name)
+        k_node = yyjson_mut_strn(doc, fspec._key_ptr, fspec._key_len)
+        v_node = _py_val_to_mut_val(doc, val, fspec.sub_schema, depth + 1)
+        yyjson_mut_obj_add(obj_node, k_node, v_node)
+
+    return obj_node
+
+
+cdef yyjson_mut_val *_py_val_to_mut_val(
+    yyjson_mut_doc *doc,
+    object val,
+    CompiledSchemaSpec sub_schema,
+    int depth
+):
+    if depth > 16 or val is None:
+        return yyjson_mut_null(doc)
+
     cdef const char *s_ptr = NULL
     cdef Py_ssize_t s_len = 0
     cdef yyjson_mut_val *arr_node
     cdef yyjson_mut_val *obj_node
-    cdef yyjson_mut_val *k_node
-    cdef yyjson_mut_val *v_node
     cdef object item, k, v
+    cdef object dyn_spec
+    cdef str s_val
 
-    if val is None:
-        return yyjson_mut_null(doc)
-    elif isinstance(val, bool):
+    if sub_schema is not None and not isinstance(val, list):
+        return _build_schema_mut_obj(doc, val, sub_schema, depth)
+
+    if isinstance(val, bool):
         return yyjson_mut_bool(doc, 1 if val else 0)
-    elif isinstance(val, int):
-        return yyjson_mut_sint(doc, <int64_t>val)
-    elif isinstance(val, float):
+    if isinstance(val, int):
+        if -9223372036854775808 <= val <= 9223372036854775807:
+            return yyjson_mut_sint(doc, <int64_t>val)
+        s_val = str(val)
+        s_ptr = PyUnicode_AsUTF8AndSize(s_val, &s_len)
+        return yyjson_mut_strn(doc, s_ptr, <size_t>s_len)
+    if isinstance(val, float):
         return yyjson_mut_real(doc, <double>val)
-    elif isinstance(val, str):
+    if isinstance(val, str):
         s_ptr = PyUnicode_AsUTF8AndSize(val, &s_len)
         return yyjson_mut_strn(doc, s_ptr, <size_t>s_len)
-    elif isinstance(val, list):
+    if isinstance(val, list):
         arr_node = yyjson_mut_arr(doc)
         for item in (<list>val):
-            v_node = _py_val_to_yyjson_mut(doc, item)
-            if v_node != NULL:
-                yyjson_mut_arr_append(arr_node, v_node)
+            if sub_schema is not None and item is not None:
+                yyjson_mut_arr_append(arr_node, _build_schema_mut_obj(doc, item, sub_schema, depth + 1))
+            else:
+                yyjson_mut_arr_append(arr_node, _py_val_to_mut_val(doc, item, None, depth + 1))
         return arr_node
-    elif isinstance(val, dict):
+
+    dyn_spec = getattr(val, "__bt_schema_spec__", None)
+    if dyn_spec is not None:
+        return _build_schema_mut_obj(doc, val, <CompiledSchemaSpec>dyn_spec, depth)
+
+    if isinstance(val, dict):
         obj_node = yyjson_mut_obj(doc)
         for k, v in (<dict>val).items():
             if isinstance(k, str):
                 s_ptr = PyUnicode_AsUTF8AndSize(k, &s_len)
-                k_node = yyjson_mut_strn(doc, s_ptr, <size_t>s_len)
-                v_node = _py_val_to_yyjson_mut(doc, v)
-                if v_node != NULL:
-                    yyjson_mut_obj_add(obj_node, k_node, v_node)
+                yyjson_mut_obj_add(
+                    obj_node,
+                    yyjson_mut_strn(doc, s_ptr, <size_t>s_len),
+                    _py_val_to_mut_val(doc, v, None, depth + 1)
+                )
         return obj_node
+
     return yyjson_mut_null(doc)
 
 
@@ -1265,30 +1391,42 @@ cdef inline void _write_py_value_to_yyjson(
     bt_json_writer_t *w,
     const char *key_ptr,
     size_t key_len,
-    object val
+    object val,
+    CompiledSchemaSpec sub_schema=None
 ):
     cdef const char *s_ptr = NULL
     cdef Py_ssize_t s_len = 0
     cdef yyjson_mut_val *k_node
     cdef yyjson_mut_val *v_node
+    cdef str s_val
 
-    if val is None:
-        bt_json_writer_add_null(w, key_ptr, key_len)
-    elif isinstance(val, bool):
-        bt_json_writer_add_bool(w, key_ptr, key_len, 1 if val else 0)
-    elif isinstance(val, int):
-        bt_json_writer_add_int(w, key_ptr, key_len, <int64_t>val)
-    elif isinstance(val, float):
-        bt_json_writer_add_double(w, key_ptr, key_len, <double>val)
-    elif isinstance(val, str):
-        s_ptr = PyUnicode_AsUTF8AndSize(val, &s_len)
-        bt_json_writer_add_str(w, key_ptr, key_len, s_ptr, <size_t>s_len)
-    else:
-        k_node = yyjson_mut_strn(w.doc, key_ptr, key_len)
-        v_node = _py_val_to_yyjson_mut(w.doc, val)
-        if v_node != NULL:
-            yyjson_mut_obj_add(w.root, k_node, v_node)
+    if sub_schema is None:
+        if val is None:
+            bt_json_writer_add_null(w, key_ptr, key_len)
+            return
+        elif isinstance(val, bool):
+            bt_json_writer_add_bool(w, key_ptr, key_len, 1 if val else 0)
+            return
+        elif isinstance(val, int):
+            if -9223372036854775808 <= val <= 9223372036854775807:
+                bt_json_writer_add_int(w, key_ptr, key_len, <int64_t>val)
+            else:
+                s_val = str(val)
+                s_ptr = PyUnicode_AsUTF8AndSize(s_val, &s_len)
+                bt_json_writer_add_str(w, key_ptr, key_len, s_ptr, <size_t>s_len)
+            return
+        elif isinstance(val, float):
+            bt_json_writer_add_double(w, key_ptr, key_len, <double>val)
+            return
+        elif isinstance(val, str):
+            s_ptr = PyUnicode_AsUTF8AndSize(val, &s_len)
+            bt_json_writer_add_str(w, key_ptr, key_len, s_ptr, <size_t>s_len)
+            return
 
+    # Complex / nested value path (list, nested Schema, list[Schema], or nested dict)
+    k_node = yyjson_mut_strn(w.doc, key_ptr, key_len)
+    v_node = _py_val_to_mut_val(w.doc, val, sub_schema, 1)
+    yyjson_mut_obj_add(w.root, k_node, v_node)
 
 
 cdef int _serialize_schema_to_c_buf(
@@ -1312,9 +1450,9 @@ cdef int _serialize_schema_to_c_buf(
             val = (<dict>obj).get(fspec.name, fspec.default_val)
         else:
             val = PyObject_GetAttr(obj, fspec.name)
-        _write_py_value_to_yyjson(&writer, fspec._key_ptr, fspec._key_len, val)
+        _write_py_value_to_yyjson(&writer, fspec._key_ptr, fspec._key_len, val, fspec.sub_schema)
 
-    return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
+    return bt_json_writer_finish(&writer, out_body_buf, BT_MAX_HANDLER_BODY_CAP, out_body_len)
 
 
 cdef int _serialize_dict_to_c_buf(
@@ -1333,12 +1471,12 @@ cdef int _serialize_dict_to_c_buf(
     for k, v in d.items():
         if isinstance(k, str):
             k_ptr = PyUnicode_AsUTF8AndSize(k, &k_len)
-            _write_py_value_to_yyjson(&writer, k_ptr, <size_t>k_len, v)
+            _write_py_value_to_yyjson(&writer, k_ptr, <size_t>k_len, v, None)
 
-    return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
+    return bt_json_writer_finish(&writer, out_body_buf, BT_MAX_HANDLER_BODY_CAP, out_body_len)
 
 
-cdef int _serialize_http_exception(
+cdef inline int _serialize_http_exception(
     object detail,
     char *out_body_buf,
     size_t *out_body_len
@@ -1347,7 +1485,7 @@ cdef int _serialize_http_exception(
     if bt_json_writer_init(&writer) != 0:
         return -1
     _write_py_value_to_yyjson(&writer, "detail", 6, detail)
-    return bt_json_writer_finish(&writer, out_body_buf, 32768, out_body_len)
+    return bt_json_writer_finish(&writer, out_body_buf, BT_MAX_HANDLER_BODY_CAP, out_body_len)
 
 
 cdef inline void _write_auth_error(
@@ -1447,7 +1585,7 @@ cdef int _resolve_kwargs_for_specs(
     size_t *out_body_len,
     int *out_status_code
 ):
-    """Returns 0 on success, or 1 if a 422 validation error was written to out_body_buf."""
+    """Returns 0 on success, or 1 if a 422/401/403 error was written to out_body_buf."""
     cdef int i
     cdef CompiledParamSpec spec
     cdef bt_slice_t raw_slice
@@ -1667,13 +1805,15 @@ cdef int _execute_route_inner(
     char *out_body_buf, size_t *out_body_len,
     char *out_extra_hdrs, size_t *out_extra_hdrs_len,
     int *out_status_code
-) except? -1:
+) noexcept:
     cdef object result = None
     cdef object coro_obj = None
     cdef object first_yielded = None
     cdef object completion_fut = None
     cdef object loop = None
     cdef object prev_loop = None
+    cdef PyObject *send_res_ptr = NULL
+    cdef PySendResult send_rc
     cdef char *raw_bytes_ptr = NULL
     cdef Py_ssize_t raw_bytes_len = 0
     cdef int d_idx
@@ -1685,11 +1825,9 @@ cdef int _execute_route_inner(
     cdef object dep_obj
     cdef object anext_coro
     cdef object body_bytes_res, hdr_bytes_res, status_res
+    cdef object schema_spec_attr
     cdef list bg_tasks_list = [] if entry.has_bg_tasks else None
     cdef BackgroundTasks bg_runner
-    cdef object spec_attr = None
-    cdef PySendResult send_rc
-    cdef PyObject *res_ptr = NULL
 
     try:
         if entry.num_dep_steps > 0:
@@ -1765,29 +1903,22 @@ cdef int _execute_route_inner(
             prev_loop = events._get_running_loop()
             if prev_loop is None:
                 events._set_running_loop(loop)
-            res_ptr = NULL
             try:
-                send_rc = PyIter_Send(coro_obj, None, &res_ptr)
-            except StopIteration as stop:
-                result = stop.value
-                coro_obj.close()
-                coro_obj = None
-            finally:
-                if prev_loop is None:
-                    events._set_running_loop(None)
-            if coro_obj is not None:
+                send_rc = PyIter_Send(coro_obj, None, &send_res_ptr)
                 if send_rc == PYGEN_RETURN:
-                    result = <object>res_ptr
-                    Py_DECREF_ptr(res_ptr)
-                    coro_obj.close()
+                    result = <object>send_res_ptr
+                    Py_DECREF_ptr(send_res_ptr)
                     coro_obj = None
                 elif send_rc == PYGEN_ERROR:
                     coro_obj.close()
                     coro_obj = None
                     raise
-                elif send_rc == PYGEN_NEXT:
-                    first_yielded = <object>res_ptr
-                    Py_DECREF_ptr(res_ptr)
+                else:
+                    first_yielded = <object>send_res_ptr
+                    Py_DECREF_ptr(send_res_ptr)
+            finally:
+                if prev_loop is None:
+                    events._set_running_loop(None)
 
             if coro_obj is not None:
                 if async_client_ctx != NULL:
@@ -1807,56 +1938,38 @@ cdef int _execute_route_inner(
 
         out_status_code[0] = entry.default_status_code
 
-        # 1. Route has pre-compiled Schema spec (Fast Path)
+        # Fast C-type checks ordered by frequency (avoids raising/clearing AttributeError on hot path)
         if entry.response_schema_spec is not None:
             return _serialize_schema_to_c_buf(result, entry.response_schema_spec, out_body_buf, out_body_len)
 
-        # 2. Python dictionary (most common fast response)
         if isinstance(result, dict):
             return _serialize_dict_to_c_buf(<dict>result, out_body_buf, out_body_len)
 
-        # 3. Raw bytes with 32KB buffer overflow guard
         if isinstance(result, bytes):
             PyBytes_AsStringAndSize(result, &raw_bytes_ptr, &raw_bytes_len)
-            if <size_t>raw_bytes_len > 32768:
-                out_status_code[0] = 500
-                return -1
-            memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
-            out_body_len[0] = <size_t>raw_bytes_len
-            return 0
+            return _safe_copy_to_body_buf(raw_bytes_ptr, raw_bytes_len, out_body_buf, out_body_len)
 
-        # 4. Raw string with zero-copy UTF-8 pointer extraction and 32KB guard
         if isinstance(result, str):
             raw_bytes_ptr = <char *>PyUnicode_AsUTF8AndSize(result, &raw_bytes_len)
-            if raw_bytes_ptr == NULL or <size_t>raw_bytes_len > 32768:
-                out_status_code[0] = 500
-                return -1
-            memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
-            out_body_len[0] = <size_t>raw_bytes_len
-            return 0
+            return _safe_copy_to_body_buf(raw_bytes_ptr, raw_bytes_len, out_body_buf, out_body_len)
 
-        # 5. Schema instance without route-level spec
-        spec_attr = getattr(result, "__bt_schema_spec__", None)
-        if spec_attr is not None:
+        schema_spec_attr = getattr(result, "__bt_schema_spec__", None)
+        if schema_spec_attr is not None:
             return _serialize_schema_to_c_buf(
-                result, <CompiledSchemaSpec>spec_attr, out_body_buf, out_body_len
+                result, <CompiledSchemaSpec>schema_spec_attr, out_body_buf, out_body_len
             )
 
-        # 6. Custom response (FileResponse, HTMLResponse, SSE)
         if getattr(result, "__bt_custom_response__", False):
             body_bytes_res, hdr_bytes_res, status_res = result._render_c_response()
             out_status_code[0] = <int>status_res
             PyBytes_AsStringAndSize(body_bytes_res, &raw_bytes_ptr, &raw_bytes_len)
-            if <size_t>raw_bytes_len > 32768:
-                out_status_code[0] = 500
+            if _safe_copy_to_body_buf(raw_bytes_ptr, raw_bytes_len, out_body_buf, out_body_len) != 0:
                 return -1
-            memcpy(out_body_buf, raw_bytes_ptr, <size_t>raw_bytes_len)
-            out_body_len[0] = <size_t>raw_bytes_len
 
             if hdr_bytes_res:
                 PyBytes_AsStringAndSize(hdr_bytes_res, &raw_bytes_ptr, &raw_bytes_len)
-                if <size_t>raw_bytes_len > 2048:
-                    raw_bytes_len = 2048
+                if raw_bytes_len < 0 or <size_t>raw_bytes_len > BT_MAX_EXTRA_HDRS_CAP:
+                    return -1
                 memcpy(out_extra_hdrs, raw_bytes_ptr, <size_t>raw_bytes_len)
                 out_extra_hdrs_len[0] = <size_t>raw_bytes_len
             return 0
@@ -1983,50 +2096,71 @@ cdef int _cython_invoke_handler(
         idx -= 1
 
     cdef object mw_res
-    cdef bytes b_out, hdr_str
-    cdef size_t hlen
+    cdef bytes b_out
+    cdef char *b_ptr = NULL
+    cdef Py_ssize_t b_len = 0
+    cdef const char *k_raw = NULL
+    cdef Py_ssize_t k_raw_len = 0
+    cdef const char *v_raw = NULL
+    cdef Py_ssize_t v_raw_len = 0
+    cdef char clean_k_buf[256]
+    cdef char clean_v_buf[1024]
+    cdef size_t ck_len, cv_len, pos = 0
+    cdef str k_str, v_str
+
     try:
         mw_res = _step_coroutine_sync(next_fn(req_obj))
         if isinstance(mw_res, MiddlewareResponse):
             out_status_code[0] = (<MiddlewareResponse>mw_res).status_code
             b_out = (<MiddlewareResponse>mw_res).body
             if b_out is not None:
-                memcpy(out_body_buf, <const char *>b_out, <size_t>len(b_out))
-                out_body_len[0] = <size_t>len(b_out)
+                PyBytes_AsStringAndSize(b_out, &b_ptr, &b_len)
+                if _safe_copy_to_body_buf(b_ptr, b_len, out_body_buf, out_body_len) != 0:
+                    return -1
 
-            if (<MiddlewareResponse>mw_res)._headers:
-                safe_lines = []
-                for k, v in (<MiddlewareResponse>mw_res)._headers.items():
-                    clean_k = str(k).replace("\r", "").replace("\n", "").replace("\0", "")
-                    clean_v = str(v).replace("\r", "").replace("\n", "").replace("\0", "")
-                    safe_lines.append(f"{clean_k}: {clean_v}\r\n")
-                hdr_str = "".join(safe_lines).encode("utf-8")
-                hlen = <size_t>len(hdr_str)
-                if hlen > 2040:
-                    hlen = 2040
-                memcpy(out_extra_hdrs, <const char *>hdr_str, hlen)
-                out_extra_hdrs_len[0] = hlen
+            if (<MiddlewareResponse>mw_res).headers:
+                pos = 0
+                for k, v in (<MiddlewareResponse>mw_res).headers.items():
+                    k_str = k if isinstance(k, str) else str(k)
+                    v_str = v if isinstance(v, str) else str(v)
+                    k_raw = PyUnicode_AsUTF8AndSize(k_str, &k_raw_len)
+                    v_raw = PyUnicode_AsUTF8AndSize(v_str, &v_raw_len)
+                    ck_len = bt_sanitize_header_str(k_raw, <size_t>k_raw_len, clean_k_buf, sizeof(clean_k_buf))
+                    cv_len = bt_sanitize_header_str(v_raw, <size_t>v_raw_len, clean_v_buf, sizeof(clean_v_buf))
+                    if ck_len == 0 or pos + ck_len + cv_len + 4 > 2040:
+                        break
+                    memcpy(out_extra_hdrs + pos, clean_k_buf, ck_len)
+                    pos += ck_len
+                    out_extra_hdrs[pos] = b':'
+                    out_extra_hdrs[pos + 1] = b' '
+                    pos += 2
+                    memcpy(out_extra_hdrs + pos, clean_v_buf, cv_len)
+                    pos += cv_len
+                    out_extra_hdrs[pos] = b'\r'
+                    out_extra_hdrs[pos + 1] = b'\n'
+                    pos += 2
+                out_extra_hdrs_len[0] = pos
         elif isinstance(mw_res, dict):
-            _serialize_dict_to_c_buf(<dict>mw_res, out_body_buf, out_body_len)
+            return _serialize_dict_to_c_buf(<dict>mw_res, out_body_buf, out_body_len)
         elif isinstance(mw_res, bytes):
-            memcpy(out_body_buf, <const char *>mw_res, <size_t>len(mw_res))
-            out_body_len[0] = <size_t>len(mw_res)
+            PyBytes_AsStringAndSize(mw_res, &b_ptr, &b_len)
+            return _safe_copy_to_body_buf(b_ptr, b_len, out_body_buf, out_body_len)
         return 0
     except Exception:
         return -1
 
 
-cdef inline void _copy_sanitized_log_str(char *dst, size_t dst_cap, const char *src, size_t src_len) noexcept nogil:
-    cdef size_t n = src_len if src_len < dst_cap - 1 else dst_cap - 1
+cdef inline size_t _copy_log_str_sanitized(char *dst, const char *src, size_t src_len, size_t max_len) noexcept nogil:
+    cdef size_t n = src_len if src_len < max_len else max_len
     cdef size_t i
-    cdef char c
+    cdef unsigned char c
     for i in range(n):
-        c = src[i]
-        if c == b'"' or c == b'\\' or c == b'\n' or c == b'\r':
+        c = <unsigned char>src[i]
+        if c == b'"' or c == b'\\' or c == b'\r' or c == b'\n' or c < 0x20:
             dst[i] = b'_'
         else:
-            dst[i] = c
-    dst[n] = b'\0'
+            dst[i] = <char>c
+    return n
 
 
 cdef class CythonRingLogger:
@@ -2061,6 +2195,7 @@ cdef class CythonRingLogger:
         cdef Py_ssize_t k_len = 0
         cdef const char *s_ptr = NULL
         cdef Py_ssize_t s_len = 0
+        cdef size_t copy_klen, copy_slen
         cdef bt_log_kv_t *kv
 
         if kwargs is not None and len(kwargs) > 0:
@@ -2070,9 +2205,11 @@ cdef class CythonRingLogger:
                 if not isinstance(k, str):
                     continue
                 k_ptr = PyUnicode_AsUTF8AndSize(k, &k_len)
+                if k_ptr == NULL:
+                    continue
                 kv = &slot.kvs[kv_idx]
-                _copy_sanitized_log_str(kv.key, sizeof(kv.key), k_ptr, <size_t>k_len)
-                kv.key_len = <uint8_t>(k_len if k_len < 23 else 23)
+                copy_klen = _copy_log_str_sanitized(kv.key, k_ptr, <size_t>k_len, 23)
+                kv.key_len = <uint8_t>copy_klen
 
                 if isinstance(v, bool):
                     kv.val_type = BT_LOG_VAL_BOOL
@@ -2087,11 +2224,12 @@ cdef class CythonRingLogger:
                     kv.v.f_val = <double>v
                     kv_idx += 1
                 elif isinstance(v, str):
-                    kv.val_type = BT_LOG_VAL_STR
                     s_ptr = PyUnicode_AsUTF8AndSize(v, &s_len)
-                    _copy_sanitized_log_str(kv.v.s_val, sizeof(kv.v.s_val), s_ptr, <size_t>s_len)
-                    kv.str_len = <uint8_t>(s_len if s_len < 47 else 47)
-                    kv_idx += 1
+                    if s_ptr != NULL:
+                        kv.val_type = BT_LOG_VAL_STR
+                        copy_slen = _copy_log_str_sanitized(kv.v.s_val, s_ptr, <size_t>s_len, 47)
+                        kv.str_len = <uint8_t>copy_slen
+                        kv_idx += 1
 
         slot.num_kvs = kv_idx
         bt_logger_publish_slot(self._logger)
@@ -2151,9 +2289,12 @@ cdef class CoreRouter:
         )
         cdef bytes encoded = PyBytes_FromStringAndSize(frame_buf, <Py_ssize_t>written)
         cdef WebSocket ws
+        cdef list active_subs = []
         for ws in subs:
             if not ws.closed:
                 ws.push_published_frame(encoded)
+                active_subs.append(ws)
+        self._ws_pubsub[topic] = active_subs
 
     cpdef void add_route(
         self,

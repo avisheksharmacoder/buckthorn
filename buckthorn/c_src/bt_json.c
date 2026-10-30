@@ -1,14 +1,26 @@
 /* buckthorn/c_src/bt_json.c */
 #include "bt_json.h"
+#include <limits.h>
+#include <math.h>
 #include <string.h>
 
-/* Pre-allocated C pools for zero-malloc yyjson read and write per worker thread */
+/* Pre-allocated 128KB C pools for zero-malloc yyjson read and write per worker thread */
 static _Thread_local char tls_read_pool[131072];
 static _Thread_local yyjson_alc tls_read_alc;
+static _Thread_local yyjson_obj_iter tls_read_iter;
+static _Thread_local const yyjson_val *tls_read_iter_root = NULL;
 
-/* Pre-allocated 128KB write pool to prevent pool exhaustion on payloads up to 32KB */
 static _Thread_local char tls_write_pool[131072];
 static _Thread_local yyjson_alc tls_write_alc;
+
+static inline yyjson_val *bt_lookup_obj_field(
+    bt_json_doc_t *jdoc, const char *key, size_t key_len
+) {
+    if (yyjson_likely(tls_read_iter_root == jdoc->root)) {
+        return yyjson_obj_iter_getn(&tls_read_iter, key, key_len);
+    }
+    return yyjson_obj_getn(jdoc->root, key, key_len);
+}
 
 int bt_json_parse_obj(const char *buf, size_t len, bt_json_doc_t *out_doc) {
     out_doc->doc = NULL;
@@ -22,13 +34,14 @@ int bt_json_parse_obj(const char *buf, size_t len, bt_json_doc_t *out_doc) {
     if (!doc) return -1;
 
     yyjson_val *root = yyjson_doc_get_root(doc);
-    if (!root || !yyjson_is_obj(root)) {
+    if (!root || !unsafe_yyjson_is_obj(root)) {
         return -1;
     }
 
     out_doc->doc = doc;
     out_doc->root = root;
-    yyjson_obj_iter_init(root, &out_doc->iter);
+    yyjson_obj_iter_init(root, &tls_read_iter);
+    tls_read_iter_root = root;
     return 0;
 }
 
@@ -43,13 +56,14 @@ int bt_json_parse_obj_insitu(char *buf, size_t len, bt_json_doc_t *out_doc) {
     if (!doc) return -1;
 
     yyjson_val *root = yyjson_doc_get_root(doc);
-    if (!root || !yyjson_is_obj(root)) {
+    if (!root || !unsafe_yyjson_is_obj(root)) {
         return -1;
     }
 
     out_doc->doc = doc;
     out_doc->root = root;
-    yyjson_obj_iter_init(root, &out_doc->iter);
+    yyjson_obj_iter_init(root, &tls_read_iter);
+    tls_read_iter_root = root;
     return 0;
 }
 
@@ -63,18 +77,22 @@ bt_val_error_t bt_json_get_int64_checked(
     int *out_found,
     int64_t *out_val
 ) {
-    yyjson_val *val = yyjson_obj_iter_getn(&jdoc->iter, key, key_len);
-    if (!val || yyjson_is_null(val)) {
+    yyjson_val *val = bt_lookup_obj_field(jdoc, key, key_len);
+    if (!val || unsafe_yyjson_is_null(val)) {
         *out_found = 0;
         return BT_ERR_NONE;
     }
     *out_found = 1;
 
-    if (!yyjson_is_int(val)) {
+    if (!unsafe_yyjson_is_int(val)) {
+        return BT_ERR_TYPE_INT;
+    }
+    /* Prevent uint64_t > INT64_MAX from silently wrapping around to negative int64_t */
+    if (unsafe_yyjson_is_uint(val) && unsafe_yyjson_get_uint(val) > (uint64_t)INT64_MAX) {
         return BT_ERR_TYPE_INT;
     }
 
-    int64_t v = yyjson_get_sint(val);
+    int64_t v = unsafe_yyjson_get_sint(val);
     if (has_ge && v < ge) return BT_ERR_NUMBER_GE;
     if (has_le && v > le) return BT_ERR_NUMBER_LE;
     if (has_gt && v <= gt) return BT_ERR_NUMBER_GT;
@@ -94,18 +112,21 @@ bt_val_error_t bt_json_get_double_checked(
     int *out_found,
     double *out_val
 ) {
-    yyjson_val *val = yyjson_obj_iter_getn(&jdoc->iter, key, key_len);
-    if (!val || yyjson_is_null(val)) {
+    yyjson_val *val = bt_lookup_obj_field(jdoc, key, key_len);
+    if (!val || unsafe_yyjson_is_null(val)) {
         *out_found = 0;
         return BT_ERR_NONE;
     }
     *out_found = 1;
 
-    if (!yyjson_is_num(val)) {
+    if (!unsafe_yyjson_is_num(val)) {
         return BT_ERR_TYPE_FLOAT;
     }
 
-    double v = yyjson_get_num(val);
+    double v = unsafe_yyjson_get_num(val);
+    if (yyjson_unlikely(!isfinite(v))) {
+        return BT_ERR_TYPE_FLOAT;
+    }
     if (has_ge && v < ge) return BT_ERR_NUMBER_GE;
     if (has_le && v > le) return BT_ERR_NUMBER_LE;
     if (has_gt && v <= gt) return BT_ERR_NUMBER_GT;
@@ -121,18 +142,18 @@ bt_val_error_t bt_json_get_bool_checked(
     int *out_found,
     int *out_val
 ) {
-    yyjson_val *val = yyjson_obj_iter_getn(&jdoc->iter, key, key_len);
-    if (!val || yyjson_is_null(val)) {
+    yyjson_val *val = bt_lookup_obj_field(jdoc, key, key_len);
+    if (!val || unsafe_yyjson_is_null(val)) {
         *out_found = 0;
         return BT_ERR_NONE;
     }
     *out_found = 1;
 
-    if (!yyjson_is_bool(val)) {
+    if (!unsafe_yyjson_is_bool(val)) {
         return BT_ERR_TYPE_INT;
     }
 
-    *out_val = yyjson_get_bool(val) ? 1 : 0;
+    *out_val = unsafe_yyjson_get_bool(val) ? 1 : 0;
     return BT_ERR_NONE;
 }
 
@@ -145,22 +166,29 @@ bt_val_error_t bt_json_get_str_checked(
     const char **out_str,
     size_t *out_len
 ) {
-    yyjson_val *val = yyjson_obj_iter_getn(&jdoc->iter, key, key_len);
-    if (!val || yyjson_is_null(val)) {
+    yyjson_val *val = bt_lookup_obj_field(jdoc, key, key_len);
+    if (!val || unsafe_yyjson_is_null(val)) {
         *out_found = 0;
         return BT_ERR_NONE;
     }
     *out_found = 1;
 
-    if (!yyjson_is_str(val)) {
+    if (!unsafe_yyjson_is_str(val)) {
         return BT_ERR_STR_MIN_LEN;
     }
 
-    size_t slen = yyjson_get_len(val);
+    size_t slen = unsafe_yyjson_get_len(val);
+    const char *s = unsafe_yyjson_get_str(val);
+
+    /* OWASP ASVS V5: Reject embedded NUL bytes (\u0000) to prevent C/Python truncation mismatches */
+    if (yyjson_unlikely(s && slen > 0 && memchr(s, '\0', slen) != NULL)) {
+        return BT_ERR_STR_MIN_LEN;
+    }
+
     if (has_min_len && slen < min_len) return BT_ERR_STR_MIN_LEN;
     if (has_max_len && slen > max_len) return BT_ERR_STR_MAX_LEN;
 
-    *out_str = yyjson_get_str(val);
+    *out_str = s;
     *out_len = slen;
     return BT_ERR_NONE;
 }
@@ -170,8 +198,8 @@ yyjson_val *bt_json_get_raw_field(
     const char *key, size_t key_len,
     int *out_found
 ) {
-    yyjson_val *val = yyjson_obj_iter_getn(&jdoc->iter, key, key_len);
-    if (!val || yyjson_is_null(val)) {
+    yyjson_val *val = bt_lookup_obj_field(jdoc, key, key_len);
+    if (!val || unsafe_yyjson_is_null(val)) {
         *out_found = 0;
         return NULL;
     }
@@ -183,6 +211,7 @@ int bt_json_writer_init(bt_json_writer_t *w) {
     yyjson_alc_pool_init(&tls_write_alc, tls_write_pool, sizeof(tls_write_pool));
     w->doc = yyjson_mut_doc_new(&tls_write_alc);
     if (!w->doc) return -1;
+    /* Pre-size value pool for up to 63 key-value pairs in the initial chunk */
     yyjson_mut_doc_set_val_pool_size(w->doc, 128);
     w->root = yyjson_mut_obj(w->doc);
     if (!w->root) return -1;
@@ -190,42 +219,33 @@ int bt_json_writer_init(bt_json_writer_t *w) {
     return 0;
 }
 
-static inline yyjson_mut_val *bt_mut_key(yyjson_mut_val *kv, const char *key, size_t key_len) {
-    bool noesc = unsafe_yyjson_is_str_noesc(key, key_len);
-    kv->tag = ((uint64_t)key_len << YYJSON_TAG_BIT) | YYJSON_TYPE_STR;
-    kv->tag |= noesc ? YYJSON_SUBTYPE_NOESC : YYJSON_SUBTYPE_NONE;
-    kv->uni.str = key;
-    return kv;
-}
-
 void bt_json_writer_add_int(bt_json_writer_t *w, const char *key, size_t key_len, int64_t val) {
     yyjson_mut_val *kv = unsafe_yyjson_mut_val(w->doc, 2);
-    if (!kv) return;
-    size_t len = unsafe_yyjson_get_len(w->root);
-    yyjson_mut_val *k = bt_mut_key(kv, key, key_len);
-    yyjson_mut_val *v = kv + 1;
-    unsafe_yyjson_set_sint(v, val);
-    unsafe_yyjson_mut_obj_add(w->root, k, v, len);
+    if (yyjson_unlikely(!kv)) return;
+    kv[0].tag = ((uint64_t)key_len << YYJSON_TAG_BIT) | YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC;
+    kv[0].uni.str = key;
+    kv[1].tag = YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT;
+    kv[1].uni.i64 = val;
+    unsafe_yyjson_mut_obj_add(w->root, &kv[0], &kv[1], unsafe_yyjson_get_len(w->root));
 }
 
 void bt_json_writer_add_double(bt_json_writer_t *w, const char *key, size_t key_len, double val) {
     yyjson_mut_val *kv = unsafe_yyjson_mut_val(w->doc, 2);
-    if (!kv) return;
-    size_t len = unsafe_yyjson_get_len(w->root);
-    yyjson_mut_val *k = bt_mut_key(kv, key, key_len);
-    yyjson_mut_val *v = kv + 1;
-    unsafe_yyjson_set_real(v, val);
-    unsafe_yyjson_mut_obj_add(w->root, k, v, len);
+    if (yyjson_unlikely(!kv)) return;
+    kv[0].tag = ((uint64_t)key_len << YYJSON_TAG_BIT) | YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC;
+    kv[0].uni.str = key;
+    kv[1].tag = YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL;
+    kv[1].uni.f64 = val;
+    unsafe_yyjson_mut_obj_add(w->root, &kv[0], &kv[1], unsafe_yyjson_get_len(w->root));
 }
 
 void bt_json_writer_add_bool(bt_json_writer_t *w, const char *key, size_t key_len, int val) {
     yyjson_mut_val *kv = unsafe_yyjson_mut_val(w->doc, 2);
-    if (!kv) return;
-    size_t len = unsafe_yyjson_get_len(w->root);
-    yyjson_mut_val *k = bt_mut_key(kv, key, key_len);
-    yyjson_mut_val *v = kv + 1;
-    unsafe_yyjson_set_bool(v, val != 0);
-    unsafe_yyjson_mut_obj_add(w->root, k, v, len);
+    if (yyjson_unlikely(!kv)) return;
+    kv[0].tag = ((uint64_t)key_len << YYJSON_TAG_BIT) | YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC;
+    kv[0].uni.str = key;
+    kv[1].tag = YYJSON_TYPE_BOOL | (val ? YYJSON_SUBTYPE_TRUE : YYJSON_SUBTYPE_FALSE);
+    unsafe_yyjson_mut_obj_add(w->root, &kv[0], &kv[1], unsafe_yyjson_get_len(w->root));
 }
 
 void bt_json_writer_add_str(bt_json_writer_t *w, const char *key, size_t key_len,
@@ -235,31 +255,28 @@ void bt_json_writer_add_str(bt_json_writer_t *w, const char *key, size_t key_len
         return;
     }
     yyjson_mut_val *kv = unsafe_yyjson_mut_val(w->doc, 2);
-    if (!kv) return;
-    size_t len = unsafe_yyjson_get_len(w->root);
-    yyjson_mut_val *k = bt_mut_key(kv, key, key_len);
-    yyjson_mut_val *v = kv + 1;
-    bool v_noesc = unsafe_yyjson_is_str_noesc(val, val_len);
-    v->tag = ((uint64_t)val_len << YYJSON_TAG_BIT) | YYJSON_TYPE_STR;
-    v->tag |= v_noesc ? YYJSON_SUBTYPE_NOESC : YYJSON_SUBTYPE_NONE;
-    v->uni.str = val;
-    unsafe_yyjson_mut_obj_add(w->root, k, v, len);
+    if (yyjson_unlikely(!kv)) return;
+    kv[0].tag = ((uint64_t)key_len << YYJSON_TAG_BIT) | YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC;
+    kv[0].uni.str = key;
+    kv[1].tag = ((uint64_t)val_len << YYJSON_TAG_BIT) | YYJSON_TYPE_STR;
+    kv[1].uni.str = val;
+    unsafe_yyjson_mut_obj_add(w->root, &kv[0], &kv[1], unsafe_yyjson_get_len(w->root));
 }
 
 void bt_json_writer_add_null(bt_json_writer_t *w, const char *key, size_t key_len) {
     yyjson_mut_val *kv = unsafe_yyjson_mut_val(w->doc, 2);
-    if (!kv) return;
-    size_t len = unsafe_yyjson_get_len(w->root);
-    yyjson_mut_val *k = bt_mut_key(kv, key, key_len);
-    yyjson_mut_val *v = kv + 1;
-    unsafe_yyjson_set_null(v);
-    unsafe_yyjson_mut_obj_add(w->root, k, v, len);
+    if (yyjson_unlikely(!kv)) return;
+    kv[0].tag = ((uint64_t)key_len << YYJSON_TAG_BIT) | YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC;
+    kv[0].uni.str = key;
+    kv[1].tag = YYJSON_TYPE_NULL;
+    unsafe_yyjson_mut_obj_add(w->root, &kv[0], &kv[1], unsafe_yyjson_get_len(w->root));
 }
 
 int bt_json_writer_finish(bt_json_writer_t *w, char *out_buf, size_t out_cap, size_t *out_len) {
     yyjson_write_err err;
+    /* Write directly into caller's arena out_buf without pool allocation or memcpy */
     size_t written = yyjson_mut_write_buf(out_buf, out_cap, w->doc, 0, &err);
-    if (written == 0 && err.code != YYJSON_WRITE_SUCCESS) {
+    if (yyjson_unlikely(written == 0 && err.code != YYJSON_WRITE_SUCCESS)) {
         return -1;
     }
     *out_len = written;

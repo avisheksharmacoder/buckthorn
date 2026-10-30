@@ -132,9 +132,11 @@ def test_full_suite_speed_gate_phase3():
         return order
 
     client = RawTestClient(app)
+    body = b'{"order_id":1001,"customer":"Alice","amount":99.95,"is_paid":true}'
     raw_req = (
-        b"POST /order HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 68\r\n\r\n"
-        b'{"order_id":1001,"customer":"Alice","amount":99.95,"is_paid":true}'
+        b"POST /order HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        + body
     )
 
     for _ in range(1000):

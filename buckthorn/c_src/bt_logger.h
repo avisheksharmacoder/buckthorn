@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <sys/types.h>
 
 #define BT_LOG_LEVEL_DEBUG 1
 #define BT_LOG_LEVEL_INFO  2
@@ -41,20 +42,24 @@ typedef struct {
     bt_log_kv_t kvs[BT_LOG_MAX_KVS];
 } bt_log_entry_t;
 
-#include <stdalign.h>
-
 typedef struct {
+    /* Cache Line 0: Read-mostly configuration state */
     bt_log_entry_t *slots;
     size_t capacity;
     size_t mask;
-    _Alignas(64) _Atomic size_t write_idx;
-    size_t cached_read_idx;
-    _Alignas(64) _Atomic size_t read_idx;
     _Atomic int running;
     int fd;
     int owns_fd;
-    pthread_t thread;
+
+    /* Cache Line 1: Producer-owned state (HTTP worker thread) */
+    _Alignas(64) _Atomic size_t write_idx;
+    size_t cached_read_idx;
     uint64_t dropped_count;
+    pid_t owner_pid;
+
+    /* Cache Line 2: Consumer-owned state (Background flusher pthread) */
+    _Alignas(64) _Atomic size_t read_idx;
+    pthread_t thread;
 } bt_logger_t;
 
 bt_logger_t *bt_logger_create(const char *filepath, size_t capacity);

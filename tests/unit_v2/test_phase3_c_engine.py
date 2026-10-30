@@ -419,3 +419,19 @@ def test_middleware_snprintf_buffer_clamping():
     )
     assert res.status_code == 204
     assert "Access-Control-Allow-Origin" in res.headers
+
+
+def test_dynamic_overflow_arena_reclamation():
+    """Verify that arena offset resets cleanly to baseline after request handling."""
+    app = Buckthorn()
+
+    @app.get("/arena-check")
+    def arena_check():
+        return {"status": "ok"}
+
+    client = RawTestClient(app)
+    for _ in range(100):
+        res = client.get("/arena-check")
+        assert res.status_code == 200
+        assert client.arena_offset == 0
+

@@ -6,7 +6,7 @@
 #include <string.h>
 #include <strings.h>
 
-static const char *WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+static const char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 int bt_ws_compute_accept(
     const char *client_key,
@@ -20,7 +20,7 @@ int bt_ws_compute_accept(
     }
 
     char concat_buf[256];
-    size_t guid_len = 36;
+    const size_t guid_len = sizeof(WS_GUID) - 1;
     memcpy(concat_buf, client_key, client_key_len);
     memcpy(concat_buf + client_key_len, WS_GUID, guid_len);
 
@@ -61,10 +61,13 @@ int bt_ws_parse_frame(
     size_t buf_len,
     bt_ws_frame_t *out_frame
 ) {
-    if (buf_len < 2) return -1;
+    if (!buf || buf_len < 2 || !out_frame) return -1;
 
     uint8_t b0 = (uint8_t)buf[0];
     uint8_t b1 = (uint8_t)buf[1];
+
+    /* RFC 6455 Section 5.2: RSV1, RSV2, RSV3 bits MUST be 0 unless negotiated */
+    if ((b0 & 0x70) != 0) return -1;
 
     out_frame->fin = (b0 >> 7) & 0x01;
     out_frame->opcode = b0 & 0x0F;
@@ -72,6 +75,13 @@ int bt_ws_parse_frame(
 
     size_t payload_len = (size_t)(b1 & 0x7F);
     size_t pos = 2;
+
+    /* RFC 6455 Section 5.5: Control frames (opcode >= 0x8) MUST NOT be fragmented or > 125B */
+    if ((out_frame->opcode & 0x08) != 0) {
+        if (out_frame->fin == 0 || payload_len > 125) {
+            return -1;
+        }
+    }
 
     if (payload_len == 126) {
         if (buf_len < 4) return -1;
@@ -95,7 +105,7 @@ int bt_ws_parse_frame(
         pos += 4;
     }
 
-    /* Subtraction-safe bounds check: immune to `pos + payload_len` 64-bit wrap-around! */
+    /* Subtraction-safe bounds check: immune to `pos + payload_len` 64-bit wrap-around */
     if (pos > buf_len || payload_len > (buf_len - pos)) {
         return -1;
     }
@@ -119,17 +129,11 @@ size_t bt_ws_encode_frame(
     char *out_buf,
     size_t out_cap
 ) {
-    size_t ext_hdr_len = 0;
-    if (payload_len < 126) {
-        ext_hdr_len = 0;
-    } else if (payload_len <= 65535) {
-        ext_hdr_len = 2;
-    } else {
-        ext_hdr_len = 8;
-    }
+    if (!out_buf) return 0;
 
-    size_t hdr_len = 2 + ext_hdr_len + (mask_frame ? 4 : 0);
-    if (hdr_len + payload_len > out_cap) return 0;
+    size_t ext_len = (payload_len < 126) ? 0 : (payload_len <= 65535 ? 2 : 8);
+    size_t hdr_len = 2 + ext_len + (mask_frame ? 4 : 0);
+    if (hdr_len > out_cap || payload_len > (out_cap - hdr_len)) return 0;
 
     out_buf[0] = (char)(0x80 | (opcode & 0x0F)); /* FIN = 1 */
     uint8_t mask_bit = mask_frame ? 0x80 : 0x00;
@@ -144,8 +148,10 @@ size_t bt_ws_encode_frame(
         pos = 4;
     } else {
         out_buf[1] = (char)(mask_bit | 127);
+        uint64_t len64 = (uint64_t)payload_len;
         for (int i = 7; i >= 0; i--) {
-            out_buf[2 + (7 - i)] = (char)((payload_len >> (i * 8)) & 0xFF);
+            out_buf[2 + i] = (char)(len64 & 0xFF);
+            len64 >>= 8;
         }
         pos = 10;
     }
@@ -166,23 +172,45 @@ size_t bt_ws_encode_frame(
     return pos + payload_len;
 }
 
-/* Portable SIMD-accelerated memmem helper for scanning multipart boundaries */
-static const char *bt_memmem(const char *haystack, size_t hlen, const char *needle, size_t nlen) {
-#if defined(__GLIBC__) || defined(_GNU_SOURCE)
-    return (const char *)memmem(haystack, hlen, needle, nlen);
-#else
+/* SIMD-accelerated memchr + memcmp boundary scanner */
+static inline const char *bt_memmem(
+    const char *haystack, size_t hlen, const char *needle, size_t nlen
+) {
     if (nlen == 0) return haystack;
-    if (hlen < nlen) return NULL;
+    if (!haystack || !needle || hlen < nlen) return NULL;
+
+    const unsigned char first = (unsigned char)needle[0];
     const char *cur = haystack;
-    const char *end = haystack + hlen - nlen;
-    while (cur <= end) {
-        const char *cand = (const char *)memchr(cur, needle[0], (size_t)(end - cur + 1));
-        if (!cand) return NULL;
-        if (memcmp(cand, needle, nlen) == 0) return cand;
-        cur = cand + 1;
+    const char *last_possible = haystack + (hlen - nlen);
+
+    while (cur <= last_possible) {
+        const char *hit = (const char *)memchr(
+            cur, first, (size_t)(last_possible - cur + 1)
+        );
+        if (!hit) return NULL;
+        if (nlen == 1 || memcmp(hit + 1, needle + 1, nlen - 1) == 0) {
+            return hit;
+        }
+        cur = hit + 1;
     }
     return NULL;
-#endif
+}
+
+/* Matches a Content-Disposition parameter only when preceded by a token boundary */
+static const char *bt_find_disposition_param(
+    const char *hdrs, size_t hdrs_len, const char *param, size_t param_len
+) {
+    const char *cur = hdrs;
+    const char *end = hdrs + hdrs_len;
+    while (cur < end) {
+        const char *pos = bt_memmem(cur, (size_t)(end - cur), param, param_len);
+        if (!pos) return NULL;
+        if (pos == hdrs || pos[-1] == ' ' || pos[-1] == '\t' || pos[-1] == ';') {
+            return pos;
+        }
+        cur = pos + 1;
+    }
+    return NULL;
 }
 
 int bt_multipart_extract_file(
@@ -210,6 +238,9 @@ int bt_multipart_extract_file(
     const char *semi = (const char *)memchr(b_val, ';', b_len);
     if (semi) b_len = (size_t)(semi - b_val);
 
+    while (b_len > 0 && (b_val[b_len - 1] == ' ' || b_val[b_len - 1] == '\t')) {
+        b_len--;
+    }
     if (b_len >= 2 && b_val[0] == '"' && b_val[b_len - 1] == '"') {
         b_val++;
         b_len -= 2;
@@ -253,8 +284,8 @@ int bt_multipart_extract_file(
             part_data_len -= 2;
         }
 
-        /* Extract name="..." from Content-Disposition */
-        const char *name_pos = bt_memmem(cur, part_hdrs_len, "name=\"", 6);
+        /* Extract name="..." without colliding with filename="..." */
+        const char *name_pos = bt_find_disposition_param(cur, part_hdrs_len, "name=\"", 6);
         if (name_pos) {
             const char *n_start = name_pos + 6;
             const char *n_end = (const char *)memchr(n_start, '"', (size_t)(hdr_end - n_start));
@@ -267,22 +298,32 @@ int bt_multipart_extract_file(
                     out_part->field_name.found = 1;
 
                     /* Extract filename="..." */
-                    const char *fn_pos = bt_memmem(cur, part_hdrs_len, "filename=\"", 10);
+                    const char *fn_pos = bt_find_disposition_param(
+                        cur, part_hdrs_len, "filename=\"", 10
+                    );
                     if (fn_pos) {
                         const char *fn_start = fn_pos + 10;
                         const char *fn_end = (const char *)memchr(
                             fn_start, '"', (size_t)(hdr_end - fn_start)
                         );
                         if (fn_end) {
-                            /* Strip any directory path traversal prefixes (/ or \) */
+                            /* Strip directory traversal prefixes (/ or \) and reject control bytes */
+                            int valid_fn = 1;
                             for (const char *p = fn_start; p < fn_end; p++) {
-                                if (*p == '/' || *p == '\\') {
+                                unsigned char c = (unsigned char)*p;
+                                if (c < 0x20 || c == 0x7F) {
+                                    valid_fn = 0;
+                                    break;
+                                }
+                                if (c == '/' || c == '\\') {
                                     fn_start = p + 1;
                                 }
                             }
-                            out_part->filename.ptr = fn_start;
-                            out_part->filename.len = (size_t)(fn_end - fn_start);
-                            out_part->filename.found = 1;
+                            if (valid_fn) {
+                                out_part->filename.ptr = fn_start;
+                                out_part->filename.len = (size_t)(fn_end - fn_start);
+                                out_part->filename.found = 1;
+                            }
                         }
                     }
 

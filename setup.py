@@ -1,11 +1,14 @@
 # setup.py
+import os
 import platform
 from setuptools import setup, find_packages, Extension
 from Cython.Build import cythonize
 
+portable_wheel = os.environ.get("BUCKTHORN_PORTABLE_WHEEL", "0") == "1"
+arch = platform.machine()
+
 extra_compile_args = [
     "-O3",
-    "-march=native",
     "-flto",
     "-fstack-protector-strong",
     "-D_FORTIFY_SOURCE=2",
@@ -13,6 +16,8 @@ extra_compile_args = [
     "-DYYJSON_DISABLE_INCR_READER=1",
     "-DYYJSON_DISABLE_FILE=1",
     "-DYYJSON_DISABLE_UTILS=1",
+    "-DYYJSON_READER_DEPTH_LIMIT=64",
+    "-DYYJSON_WRITER_DEPTH_LIMIT=64",
     "-Wformat",
     "-Wformat-security",
     "-Werror=format-security",
@@ -20,9 +25,13 @@ extra_compile_args = [
     "-Wno-unused-function",
 ]
 
-# Conditionally gate -msse4.2 for x86_64 / AMD64 architectures to preserve ARM64 portability
-if platform.machine() in ("x86_64", "AMD64"):
+if not portable_wheel:
+    extra_compile_args.append("-march=native")
+
+if arch in ("x86_64", "AMD64"):
     extra_compile_args.append("-msse4.2")
+elif arch in ("aarch64", "arm64") and portable_wheel:
+    extra_compile_args.append("-march=armv8-a")
 
 ext_modules = [
     Extension(
@@ -59,6 +68,8 @@ setup(
     name="buckthorn",
     version="1.1.0",
     packages=find_packages(),
+    package_data={"buckthorn": ["py.typed", "*.pyi"]},
+    include_package_data=True,
     ext_modules=cythonize(
         ext_modules,
         compiler_directives={

@@ -28,6 +28,9 @@ typedef enum {
     BT_ERR_STR_MAX_LEN = 9
 } bt_val_error_t;
 
+/* Decodes %XX (and '+' if plus_as_space != 0) in-place via TLS scratch buffer when needed */
+int bt_url_decode_slice(bt_slice_t *slice, int plus_as_space);
+
 /* Zero-copy scanners over raw HTTP buffers */
 int bt_find_query_param(const char *query, size_t query_len,
                         const char *key, size_t key_len, bt_slice_t *out_val);

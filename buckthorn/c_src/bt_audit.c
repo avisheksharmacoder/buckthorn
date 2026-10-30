@@ -6,26 +6,39 @@
 #include <string.h>
 #include <strings.h>
 
+static inline int bt_is_hex_char(unsigned char c) {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
 static inline int bt_path_is_safe(const char *path, size_t path_len) {
     if (!path || path_len == 0 || path[0] != '/') return 0;
 
     for (size_t i = 0; i < path_len; i++) {
         unsigned char c = (unsigned char)path[i];
-        /* Reject control characters, spaces, backslashes, or null bytes */
-        if (c <= 0x20 || c == 0x7F || c == '\\') {
+        /* Reject control characters, spaces, DEL/non-ASCII, backslashes, or null bytes */
+        if (c <= 0x20 || c >= 0x7F || c == '\\') {
             return 0;
         }
         /* Reject literal ".." path traversal segments */
         if (c == '.' && (i + 1 < path_len) && path[i + 1] == '.') {
             return 0;
         }
-        /* Reject URL-encoded null byte "%00" or dot "%2e" / "%2E" */
-        if (c == '%' && (i + 2 < path_len)) {
+        /* Validate percent-encoded sequences and block encoded traversal vectors */
+        if (c == '%') {
+            if (i + 2 >= path_len ||
+                !bt_is_hex_char((unsigned char)path[i + 1]) ||
+                !bt_is_hex_char((unsigned char)path[i + 2])) {
+                return 0;
+            }
             char h1 = (char)((unsigned char)path[i + 1] | 0x20);
             char h2 = (char)((unsigned char)path[i + 2] | 0x20);
-            if (h1 == '0' && h2 == '0') return 0;
-            if (h1 == '2' && h2 == 'e') return 0;
-            if (h1 == '5' && h2 == 'c') return 0; /* %5c = backslash */
+            if (h1 == '0' && h2 == '0') return 0; /* %00 = null byte */
+            if (h1 == '2' && h2 == 'e') return 0; /* %2e = dot (.) */
+            if (h1 == '2' && h2 == 'f') return 0; /* %2f = forward slash (/) */
+            if (h1 == '5' && h2 == 'c') return 0; /* %5c = backslash (\) */
+            if (h1 == '2' && h2 == '5') return 0; /* %25 = double-encoded % */
         }
     }
     return 1;
@@ -72,11 +85,20 @@ bt_audit_status_t bt_audit_http_request(
             return BT_AUDIT_ERR_BAD_REQUEST;
         }
 
-        char c0 = name[0];
-        if (nlen == 4 && (c0 == 'H' || c0 == 'h') && strncasecmp(name, "Host", 4) == 0) {
+        /* Reject embedded NUL, CR, or LF inside header values */
+        for (size_t k = 0; k < vlen; k++) {
+            unsigned char vc = (unsigned char)val[k];
+            if (vc == '\0' || vc == '\r' || vc == '\n') {
+                return BT_AUDIT_ERR_BAD_REQUEST;
+            }
+        }
+
+        unsigned char c0_lower = (unsigned char)name[0] | 0x20;
+        if (nlen == 4 && c0_lower == 'h' && strncasecmp(name, "Host", 4) == 0) {
+            if (vlen == 0) return BT_AUDIT_ERR_BAD_REQUEST;
             host_count++;
             if (host_count > 1) return BT_AUDIT_ERR_BAD_REQUEST;
-        } else if (nlen == 14 && (c0 == 'C' || c0 == 'c') && strncasecmp(name, "Content-Length", 14) == 0) {
+        } else if (nlen == 14 && c0_lower == 'c' && strncasecmp(name, "Content-Length", 14) == 0) {
             cl_count++;
             if (cl_count > 1 || vlen == 0 || vlen > 19) {
                 return BT_AUDIT_ERR_BAD_REQUEST;
@@ -97,7 +119,7 @@ bt_audit_status_t bt_audit_http_request(
             if (max_body_size > 0 && parsed_cl > max_body_size) {
                 return BT_AUDIT_ERR_PAYLOAD_TOO_LARGE;
             }
-        } else if (nlen == 17 && (c0 == 'T' || c0 == 't') && strncasecmp(name, "Transfer-Encoding", 17) == 0) {
+        } else if (nlen == 17 && c0_lower == 't' && strncasecmp(name, "Transfer-Encoding", 17) == 0) {
             te_count++;
         }
     }
@@ -107,8 +129,13 @@ bt_audit_status_t bt_audit_http_request(
         return BT_AUDIT_ERR_BAD_REQUEST;
     }
 
-    /* RFC 9112: Reject requests with both Content-Length and Transfer-Encoding (CL.TE / TE.CL) */
-    if (te_count > 0 && cl_count > 0) {
+    /* Reject Transfer-Encoding (prevents CL.TE / TE.CL and unparsed chunk smuggling) */
+    if (te_count > 0) {
+        return BT_AUDIT_ERR_BAD_REQUEST;
+    }
+
+    /* Verify Content-Length matches the actual body slice length */
+    if (cl_count == 1 && parsed_cl != body_len) {
         return BT_AUDIT_ERR_BAD_REQUEST;
     }
 

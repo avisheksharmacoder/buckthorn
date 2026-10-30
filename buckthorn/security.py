@@ -35,7 +35,7 @@ class OAuth2PasswordBearer(HTTPBearer):
         self,
         tokenUrl: str,
         *,
-        jwt_secret: str = "secret",
+        jwt_secret: str,
         scopes: Optional[dict[str, str]] = None,
     ):
         super().__init__(jwt_secret=jwt_secret)
