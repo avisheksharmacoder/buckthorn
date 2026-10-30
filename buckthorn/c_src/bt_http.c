@@ -117,6 +117,13 @@ void bt_router_set_async_tick_cb(bt_router_t *router, bt_async_tick_fn tick_cb) 
     if (router) router->tick_cb = tick_cb;
 }
 
+void bt_router_set_ws_cb(bt_router_t *router, bt_ws_event_fn ws_cb, void *router_ctx) {
+    if (router) {
+        router->ws_cb = ws_cb;
+        router->ws_ctx = router_ctx;
+    }
+}
+
 bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router) {
     return router ? &router->mw : NULL;
 }
@@ -579,10 +586,11 @@ int bt_handle_http_bytes(
 
 /* =========================================================================
  * Native libuv TCP Server Glue
- * (15s Slowloris Timer + HTTP/1.1 Pipelining + Dual-Handle Refcounting)
+ * (15s Slowloris Timer + HTTP/1.1 Pipelining + Live RFC 6455 WebSockets)
  * ========================================================================= */
 #define BT_TCP_READ_BUF_SIZE      (64 * 1024)
 #define BT_CLIENT_IDLE_TIMEOUT_MS 15000
+#define BT_WS_IDLE_TIMEOUT_MS     60000
 
 typedef struct {
     uv_tcp_t handle;
@@ -599,7 +607,15 @@ typedef struct {
     int open_handles;
     int is_Reading;
     int is_closing;
+    int is_websocket;
+    char ws_path[256];
+    size_t ws_path_len;
 } bt_uv_client_t;
+
+typedef struct {
+    uv_write_t req;
+    char data[];
+} bt_ws_write_req_t;
 
 typedef struct {
     bt_router_t *router;
@@ -624,6 +640,16 @@ static void on_client_handle_closed(uv_handle_t *handle) {
 
 static void bt_initiate_client_close(bt_uv_client_t *client) {
     if (!client) return;
+    if (client->is_websocket && !client->is_closing && client->router && client->router->ws_cb) {
+        client->is_websocket = 0;
+        client->router->ws_cb(
+            client->router->ws_ctx,
+            (void *)client,
+            BT_WS_EVT_CLOSE,
+            client->ws_path, client->ws_path_len,
+            NULL, 0
+        );
+    }
     client->is_closing = 1;
     if (client->is_Reading) {
         uv_read_stop((uv_stream_t *)&client->handle);
@@ -641,13 +667,14 @@ static void bt_initiate_client_close(bt_uv_client_t *client) {
 
 static void on_client_idle_timeout(uv_timer_t *timer) {
     bt_uv_client_t *client = (bt_uv_client_t *)timer->data;
-    /* Close Slowloris or idle keep-alive connection after 15 seconds of inactivity */
+    /* Close Slowloris or idle keep-alive connection after inactivity */
     bt_initiate_client_close(client);
 }
 
 static inline void bt_refresh_idle_timer(bt_uv_client_t *client) {
     if (!client->is_closing && !uv_is_closing((const uv_handle_t *)&client->idle_timer)) {
-        uv_timer_start(&client->idle_timer, on_client_idle_timeout, BT_CLIENT_IDLE_TIMEOUT_MS, 0);
+        uint64_t timeout_ms = client->is_websocket ? BT_WS_IDLE_TIMEOUT_MS : BT_CLIENT_IDLE_TIMEOUT_MS;
+        uv_timer_start(&client->idle_timer, on_client_idle_timeout, timeout_ms, 0);
     }
 }
 
@@ -659,6 +686,180 @@ static inline void bt_consume_read_bytes(bt_uv_client_t *client, size_t consumed
     } else {
         client->read_len = 0;
     }
+}
+
+static void on_ws_write_done(uv_write_t *req, int status) {
+    (void)status;
+    free(req);
+}
+
+int bt_uv_ws_send_frame(void *ws_client_ctx, const char *frame_buf, size_t frame_len) {
+    if (!ws_client_ctx || !frame_buf || frame_len == 0) return -1;
+    bt_uv_client_t *client = (bt_uv_client_t *)ws_client_ctx;
+    if (client->is_closing || uv_is_closing((const uv_handle_t *)&client->handle)) {
+        return -1;
+    }
+
+    uv_buf_t wbuf = uv_buf_init((char *)frame_buf, (unsigned int)frame_len);
+    ssize_t written = uv_try_write((uv_stream_t *)&client->handle, &wbuf, 1);
+    if (written == (ssize_t)frame_len) {
+        return 0;
+    }
+
+    size_t offset = (written > 0) ? (size_t)written : 0;
+    size_t rem = frame_len - offset;
+    bt_ws_write_req_t *wreq = (bt_ws_write_req_t *)malloc(sizeof(bt_ws_write_req_t) + rem);
+    if (!wreq) return -1;
+    memcpy(wreq->data, frame_buf + offset, rem);
+    uv_buf_t async_buf = uv_buf_init(wreq->data, (unsigned int)rem);
+    if (uv_write(&wreq->req, (uv_stream_t *)&client->handle, &async_buf, 1, on_ws_write_done) != 0) {
+        free(wreq);
+        return -1;
+    }
+    return 0;
+}
+
+void bt_uv_ws_close_client(void *ws_client_ctx) {
+    if (!ws_client_ctx) return;
+    bt_uv_client_t *client = (bt_uv_client_t *)ws_client_ctx;
+    char close_frame[8];
+    size_t flen = bt_ws_encode_frame(BT_WS_OP_CLOSE, NULL, 0, 0, close_frame, sizeof(close_frame));
+    if (flen > 0 && !client->is_closing) {
+        bt_uv_ws_send_frame(ws_client_ctx, close_frame, flen);
+    }
+    bt_initiate_client_close(client);
+}
+
+/*
+ * Inspects a WebSocket stream buffer to determine if a full RFC 6455 frame has arrived:
+ *   Returns  0 if the frame is still incomplete (wait for next TCP packet)
+ *   Returns  1 if a full frame is buffered in buf[0..len]
+ *   Returns -1 if the frame header violates RFC 6455
+ */
+static int bt_ws_stream_frame_ready(const char *buf, size_t len) {
+    if (len < 2) return 0;
+    uint8_t b0 = (uint8_t)buf[0];
+    uint8_t b1 = (uint8_t)buf[1];
+    if ((b0 & 0x70) != 0) return -1; /* RSV1..3 must be 0 */
+
+    uint8_t fin = (b0 >> 7) & 0x01;
+    uint8_t opcode = b0 & 0x0F;
+    uint8_t masked = (b1 >> 7) & 0x01;
+    size_t payload_len = (size_t)(b1 & 0x7F);
+    size_t hdr_len = 2;
+
+    if ((opcode & 0x08) != 0 && (fin == 0 || payload_len > 125)) {
+        return -1;
+    }
+    if (payload_len == 126) {
+        if (len < 4) return 0;
+        payload_len = ((size_t)(uint8_t)buf[2] << 8) | (size_t)(uint8_t)buf[3];
+        hdr_len = 4;
+    } else if (payload_len == 127) {
+        if (len < 10) return 0;
+        if ((uint8_t)buf[2] & 0x80) return -1;
+        payload_len = 0;
+        for (int i = 0; i < 8; i++) {
+            payload_len = (payload_len << 8) | (size_t)(uint8_t)buf[2 + i];
+        }
+        hdr_len = 10;
+    }
+    if (masked) hdr_len += 4;
+    if (hdr_len > BT_TCP_READ_BUF_SIZE || payload_len > (BT_TCP_READ_BUF_SIZE - hdr_len)) {
+        return -1;
+    }
+    if (len < hdr_len + payload_len) {
+        return 0; /* Wait for remaining frame bytes */
+    }
+    return 1;
+}
+
+/* Checks if an incoming HTTP request is a valid RFC 6455 WebSocket Upgrade handshake */
+static int bt_try_websocket_upgrade(bt_uv_client_t *client, size_t req_len) {
+    if (!client->router || !client->router->ws_cb) return 0;
+
+    const char *method = NULL;
+    size_t method_len = 0;
+    const char *path = NULL;
+    size_t path_len = 0;
+    int minor_version = 0;
+    struct phr_header headers[BT_MAX_HEADERS];
+    size_t num_headers = BT_MAX_HEADERS;
+
+    int pret = phr_parse_request(
+        client->read_buf, req_len,
+        &method, &method_len,
+        &path, &path_len,
+        &minor_version,
+        headers, &num_headers, 0
+    );
+    if (pret <= 0 || method_len != 3 || memcmp(method, "GET", 3) != 0) {
+        return 0;
+    }
+
+    bt_slice_t upgrade_hdr;
+    if (!bt_find_header(headers, num_headers, "Upgrade", 7, &upgrade_hdr) ||
+        upgrade_hdr.len != 9 || strncasecmp(upgrade_hdr.ptr, "websocket", 9) != 0) {
+        return 0;
+    }
+
+    bt_slice_t ws_key;
+    if (!bt_find_header(headers, num_headers, "Sec-WebSocket-Key", 17, &ws_key) ||
+        ws_key.len == 0) {
+        return -1;
+    }
+
+    size_t clean_path_len = path_len;
+    const char *qmark = (const char *)memchr(path, '?', path_len);
+    if (qmark) {
+        clean_path_len = (size_t)(qmark - path);
+    }
+    if (clean_path_len == 0 || clean_path_len >= sizeof(client->ws_path)) {
+        return -1;
+    }
+
+    char accept_key[64];
+    size_t accept_len = 0;
+    if (bt_ws_compute_accept(ws_key.ptr, ws_key.len, accept_key, sizeof(accept_key), &accept_len) != 0) {
+        return -1;
+    }
+
+    memcpy(client->ws_path, path, clean_path_len);
+    client->ws_path[clean_path_len] = '\0';
+    client->ws_path_len = clean_path_len;
+
+    /* Notify Cython router to instantiate WebSocket session and start handler coroutine */
+    if (client->router->ws_cb(
+            client->router->ws_ctx,
+            (void *)client,
+            BT_WS_EVT_OPEN,
+            client->ws_path, client->ws_path_len,
+            NULL, 0
+        ) != 0) {
+        return 0; /* Not a registered WebSocket route -> fall through to 404 */
+    }
+
+    char hs_resp[256];
+    int hs_len = snprintf(
+        hs_resp, sizeof(hs_resp),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %.*s\r\n\r\n",
+        (int)accept_len, accept_key
+    );
+    if (hs_len <= 0 || (size_t)hs_len >= sizeof(hs_resp)) {
+        return -1;
+    }
+
+    client->is_websocket = 1;
+    bt_consume_read_bytes(client, req_len);
+    bt_uv_ws_send_frame((void *)client, hs_resp, (size_t)hs_len);
+
+    if (client->async_idler && !uv_is_active((const uv_handle_t *)client->async_idler)) {
+        uv_idle_start(client->async_idler, on_uv_async_idle_tick);
+    }
+    return 1;
 }
 
 /*
@@ -821,6 +1022,56 @@ void bt_uv_complete_async_request(
 }
 
 static void bt_process_client_buffer(bt_uv_client_t *client) {
+    /* 1. Active RFC 6455 WebSocket Frame Loop */
+    if (client->is_websocket) {
+        while (client->read_len > 0 && !client->is_closing) {
+            int f_ready = bt_ws_stream_frame_ready(client->read_buf, client->read_len);
+            if (f_ready == 0) {
+                break; /* Wait for remaining frame bytes */
+            }
+            if (f_ready < 0) {
+                bt_initiate_client_close(client);
+                return;
+            }
+
+            bt_ws_frame_t frame;
+            if (bt_ws_parse_frame(client->read_buf, client->read_len, &frame) != 0) {
+                bt_initiate_client_close(client);
+                return;
+            }
+
+            if (frame.opcode == BT_WS_OP_CLOSE) {
+                bt_consume_read_bytes(client, frame.frame_total_len);
+                bt_uv_ws_close_client((void *)client);
+                return;
+            } else if (frame.opcode == 0x09) {
+                /* RFC 6455 Section 5.5.2: Automatically reply to PING (0x9) with PONG (0xA) */
+                char pong_buf[160];
+                size_t pong_len = bt_ws_encode_frame(
+                    0x0A, frame.payload_ptr, frame.payload_len, 0, pong_buf, sizeof(pong_buf)
+                );
+                if (pong_len > 0) {
+                    bt_uv_ws_send_frame((void *)client, pong_buf, pong_len);
+                }
+            } else if (client->router && client->router->ws_cb) {
+                client->router->ws_cb(
+                    client->router->ws_ctx,
+                    (void *)client,
+                    BT_WS_EVT_MESSAGE,
+                    client->ws_path, client->ws_path_len,
+                    frame.payload_ptr, frame.payload_len
+                );
+                if (client->async_idler && !uv_is_active((const uv_handle_t *)client->async_idler)) {
+                    uv_idle_start(client->async_idler, on_uv_async_idle_tick);
+                }
+            }
+
+            bt_consume_read_bytes(client, frame.frame_total_len);
+        }
+        return;
+    }
+
+    /* 2. Standard HTTP/1.1 & Pipelining Loop */
     while (client->read_len > 0 && !client->is_closing && client->in_flight_async_reqs == 0) {
         size_t req_len = client->read_len;
         int ready = bt_tcp_request_is_complete(
@@ -836,6 +1087,18 @@ static void bt_process_client_buffer(bt_uv_client_t *client) {
                 client->is_Reading = 1;
             }
             return;
+        }
+
+        if (ready == 1) {
+            int ws_rc = bt_try_websocket_upgrade(client, req_len);
+            if (ws_rc == 1) {
+                /* Upgraded to WebSocket! Process any trailing frames already in read_buf */
+                bt_refresh_idle_timer(client);
+                if (client->read_len > 0) {
+                    bt_process_client_buffer(client);
+                }
+                return;
+            }
         }
 
         bt_raw_response_t result;
@@ -953,6 +1216,9 @@ static void on_new_connection(uv_stream_t *server, int status) {
     client->open_handles = 2; /* 1 for uv_tcp_t + 1 for uv_timer_t */
     client->is_Reading = 0;
     client->is_closing = 0;
+    client->is_websocket = 0;
+    client->ws_path[0] = '\0';
+    client->ws_path_len = 0;
 
     uv_tcp_init(server->loop, &client->handle);
     client->handle.data = client;

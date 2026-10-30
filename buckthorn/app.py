@@ -131,7 +131,7 @@ def _compile_callable_params(
             continue
 
         # 2. Check if parameter is a zero-copy `Request` object
-        if annotation is Request:
+        if annotation is Request or annotation == "Request":
             specs.append(
                 CompiledParamSpec(
                     arg_name=arg_name,
@@ -144,7 +144,7 @@ def _compile_callable_params(
             continue
 
         # 3. Check if parameter is `BackgroundTasks`
-        if annotation is BackgroundTasks:
+        if annotation is BackgroundTasks or annotation == "BackgroundTasks":
             specs.append(
                 CompiledParamSpec(
                     arg_name=arg_name,
@@ -157,7 +157,7 @@ def _compile_callable_params(
             continue
 
         # 4. Check if parameter is an `UploadFile` / `File(...)` multipart field
-        if annotation is UploadFile or isinstance(default_obj, FileInfo):
+        if annotation is UploadFile or annotation == "UploadFile" or isinstance(default_obj, FileInfo):
             required = True
             if isinstance(default_obj, FileInfo):
                 required = default_obj.required
@@ -379,11 +379,15 @@ class Buckthorn:
             _step_coro(self._lifespan_ctx.__aenter__())
 
     def _shutdown(self) -> None:
-        if self._lifespan_ctx is not None:
-            try:
-                _step_coro(self._lifespan_ctx.__aexit__(None, None, None))
-            finally:
-                self._lifespan_ctx = None
+        try:
+            if self._lifespan_ctx is not None:
+                try:
+                    _step_coro(self._lifespan_ctx.__aexit__(None, None, None))
+                finally:
+                    self._lifespan_ctx = None
+        finally:
+            if self.logger is not None:
+                self.logger.flush_and_stop()
 
     def add_api_route(
         self,
@@ -565,6 +569,50 @@ class Buckthorn:
                 path,
                 fn,
                 ["DELETE"],
+                response_model=response_model,
+                status_code=status_code,
+                dependencies=dependencies,
+                tags=tags,
+            )
+            return fn
+        return decorator
+
+    def patch(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+        dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
+    ):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(
+                path,
+                fn,
+                ["PATCH"],
+                response_model=response_model,
+                status_code=status_code,
+                dependencies=dependencies,
+                tags=tags,
+            )
+            return fn
+        return decorator
+
+    def head(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+        dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
+    ):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(
+                path,
+                fn,
+                ["HEAD"],
                 response_model=response_model,
                 status_code=status_code,
                 dependencies=dependencies,

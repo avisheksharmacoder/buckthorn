@@ -55,6 +55,8 @@ from buckthorn._core cimport (
     bt_middleware_configure_cors, bt_middleware_configure_ratelimit,
     bt_middleware_configure_trusted_host, bt_middleware_configure_sec_headers,
     BT_WS_OP_TEXT, BT_WS_OP_BIN, BT_WS_OP_CLOSE,
+    BT_WS_EVT_OPEN, BT_WS_EVT_MESSAGE, BT_WS_EVT_CLOSE,
+    bt_router_set_ws_cb, bt_uv_ws_send_frame, bt_uv_ws_close_client,
     bt_ws_frame_t, bt_multipart_part_t,
     bt_ws_compute_accept, bt_ws_parse_frame, bt_ws_encode_frame,
     bt_multipart_extract_file,
@@ -498,7 +500,7 @@ cdef class UploadFile:
 
 @cython.freelist(1024)
 cdef class WebSocket:
-    """High-speed C-backed RFC 6455 WebSocket session & Pub/Sub handle."""
+    """High-speed C-backed RFC 6455 WebSocket session & Pub/Sub handle (TestClient + Live TCP)."""
     cdef public str path
     cdef public bint accepted
     cdef public bint closed
@@ -506,6 +508,8 @@ cdef class WebSocket:
     cdef public list _in_frames
     cdef public list _out_frames
     cdef public dict _pubsub_registry_ref
+    cdef uintptr_t _uv_client_ptr
+    cdef object _rx_waiter
 
     def __cinit__(self, str path="", dict pubsub_registry=None):
         self.path = path
@@ -515,6 +519,26 @@ cdef class WebSocket:
         self._in_frames = []
         self._out_frames = []
         self._pubsub_registry_ref = pubsub_registry
+        self._uv_client_ptr = 0
+        self._rx_waiter = None
+
+    cdef inline void bind_uv_client(self, void *uv_client_ctx) noexcept nogil:
+        self._uv_client_ptr = <uintptr_t>uv_client_ctx
+
+    cdef inline void _deliver_live_message(self, str text):
+        if self._rx_waiter is not None and not self._rx_waiter.done():
+            waiter = self._rx_waiter
+            self._rx_waiter = None
+            waiter.set_result(text)
+        else:
+            self._in_frames.append(text)
+
+    cdef inline void _deliver_live_close(self):
+        self.closed = True
+        if self._rx_waiter is not None and not self._rx_waiter.done():
+            waiter = self._rx_waiter
+            self._rx_waiter = None
+            waiter.set_exception(RuntimeError("WebSocket connection closed by peer"))
 
     cpdef str compute_handshake(self, str sec_websocket_key):
         cdef Py_ssize_t k_len = 0
@@ -552,17 +576,23 @@ cdef class WebSocket:
         if bt_ws_parse_frame(buf_ptr, <size_t>raw_len, &parsed) != 0:
             raise ValueError("Malformed RFC 6455 WebSocket frame")
         if parsed.opcode == BT_WS_OP_CLOSE:
-            self.closed = True
+            self._deliver_live_close()
             return
         cdef str text = PyUnicode_DecodeUTF8(
             parsed.payload_ptr, <Py_ssize_t>parsed.payload_len, "strict"
         )
-        self._in_frames.append(text)
+        self._deliver_live_message(text)
 
     async def receive_text(self) -> str:
-        if not self._in_frames:
-            raise RuntimeError("No WebSocket frame available")
-        return self._in_frames.pop(0)
+        if self._in_frames:
+            return self._in_frames.pop(0)
+        if self.closed:
+            raise RuntimeError("WebSocket connection is closed")
+        if self._uv_client_ptr != 0:
+            loop = _get_or_create_async_loop()
+            self._rx_waiter = loop.create_future()
+            return await self._rx_waiter
+        raise RuntimeError("No WebSocket frame available")
 
     cpdef bytes _encode_server_frame(self, str text):
         cdef Py_ssize_t s_len = 0
@@ -574,10 +604,28 @@ cdef class WebSocket:
         return PyBytes_FromStringAndSize(frame_buf, <Py_ssize_t>written)
 
     async def send_text(self, str data):
-        self._out_frames.append(self._encode_server_frame(data))
+        cdef Py_ssize_t s_len = 0
+        cdef const char *s_ptr = NULL
+        cdef char frame_buf[16384]
+        cdef size_t written = 0
+        if self._uv_client_ptr != 0:
+            s_ptr = PyUnicode_AsUTF8AndSize(data, &s_len)
+            written = bt_ws_encode_frame(
+                BT_WS_OP_TEXT, s_ptr, <size_t>s_len, 0, frame_buf, sizeof(frame_buf)
+            )
+            if written > 0:
+                bt_uv_ws_send_frame(<void *>self._uv_client_ptr, frame_buf, written)
+        else:
+            self._out_frames.append(self._encode_server_frame(data))
 
     cpdef void push_published_frame(self, bytes encoded_frame):
-        self._out_frames.append(encoded_frame)
+        cdef char *f_ptr = NULL
+        cdef Py_ssize_t f_len = 0
+        if self._uv_client_ptr != 0:
+            PyBytes_AsStringAndSize(encoded_frame, &f_ptr, &f_len)
+            bt_uv_ws_send_frame(<void *>self._uv_client_ptr, f_ptr, <size_t>f_len)
+        else:
+            self._out_frames.append(encoded_frame)
 
     cpdef str pop_outgoing_text(self):
         if not self._out_frames:
@@ -600,6 +648,9 @@ cdef class WebSocket:
 
     async def close(self, int code=1000):
         self.closed = True
+        if self._uv_client_ptr != 0:
+            bt_uv_ws_close_client(<void *>self._uv_client_ptr)
+            self._uv_client_ptr = 0
 
 
 cpdef bytes encode_client_masked_ws_frame(str text):
@@ -2251,6 +2302,98 @@ cdef class CythonRingLogger:
             bt_logger_flush_and_stop(self._logger)
 
 
+cdef object _match_ws_route_py(dict ws_routes, str req_path):
+    if req_path in ws_routes:
+        return ws_routes[req_path][0], {}
+    cdef list req_segs = [s for s in req_path.strip("/").split("/") if s]
+    cdef str pattern
+    cdef tuple entry_tuple
+    cdef list pat_segs
+    cdef dict kwargs
+    cdef bint ok
+    cdef Py_ssize_t i
+    for pattern, entry_tuple in ws_routes.items():
+        if "{" not in pattern:
+            continue
+        pat_segs = [s for s in pattern.strip("/").split("/") if s]
+        if len(pat_segs) != len(req_segs):
+            continue
+        kwargs = {}
+        ok = True
+        for i in range(len(pat_segs)):
+            if pat_segs[i].startswith("{") and pat_segs[i].endswith("}"):
+                kwargs[pat_segs[i][1:-1].split(":")[0]] = req_segs[i]
+            elif pat_segs[i] != req_segs[i]:
+                ok = False
+                break
+        if ok:
+            return entry_tuple[0], kwargs
+    return None, None
+
+
+cdef int _cython_ws_event_cb(
+    void *router_ctx,
+    void *ws_client_ctx,
+    int event_type,
+    const char *path, size_t path_len,
+    const char *payload, size_t payload_len
+) noexcept with gil:
+    global _PENDING_ASYNC_TASKS
+    cdef CoreRouter router = <CoreRouter>router_ctx
+    cdef uintptr_t client_key = <uintptr_t>ws_client_ctx
+    cdef WebSocket ws
+    cdef str req_path, msg_text
+    cdef object fn, loop
+    cdef dict path_kwargs
+
+    try:
+        if event_type == BT_WS_EVT_OPEN:
+            req_path = PyUnicode_DecodeUTF8(path, <Py_ssize_t>path_len, "strict")
+            fn, path_kwargs = _match_ws_route_py(router._ws_routes, req_path)
+            if fn is None:
+                return -1
+
+            ws = WebSocket(path=req_path, pubsub_registry=router._ws_pubsub)
+            ws.bind_uv_client(ws_client_ctx)
+            router._live_ws_sessions[client_key] = ws
+
+            loop = _get_or_create_async_loop()
+            _PENDING_ASYNC_TASKS += 1
+
+            async def _drive_live_ws():
+                global _PENDING_ASYNC_TASKS
+                try:
+                    await _step_coroutine_async(fn(ws, **path_kwargs), loop)
+                except Exception:
+                    pass
+                finally:
+                    _PENDING_ASYNC_TASKS -= 1
+                    router._live_ws_sessions.pop(client_key, None)
+                    if not ws.closed:
+                        await ws.close()
+
+            loop.create_task(_drive_live_ws())
+            return 0
+
+        elif event_type == BT_WS_EVT_MESSAGE:
+            ws = router._live_ws_sessions.get(client_key)
+            if ws is not None:
+                msg_text = PyUnicode_DecodeUTF8(payload, <Py_ssize_t>payload_len, "replace")
+                ws._deliver_live_message(msg_text)
+            return 0
+
+        elif event_type == BT_WS_EVT_CLOSE:
+            ws = router._live_ws_sessions.pop(client_key, None)
+            if ws is not None:
+                ws._uv_client_ptr = 0
+                ws._deliver_live_close()
+            return 0
+
+        return 0
+    except Exception:
+        return -1
+
+
 cdef class CoreRouter:
     cdef bt_router_t *_router
     cdef list _handler_refs
@@ -2258,16 +2401,19 @@ cdef class CoreRouter:
     cdef public list _user_middlewares
     cdef public dict _ws_routes
     cdef public dict _ws_pubsub
+    cdef public dict _live_ws_sessions
 
     def __cinit__(self):
         self._handler_refs = []
         self._user_middlewares = []
         self._ws_routes = {}
         self._ws_pubsub = {}
+        self._live_ws_sessions = {}
         self._router = bt_router_create(_cython_invoke_handler)
         if self._router == NULL:
             raise MemoryError("Failed to allocate C router")
         bt_router_set_async_tick_cb(self._router, _cython_async_loop_tick)
+        bt_router_set_ws_cb(self._router, _cython_ws_event_cb, <void *>self)
 
     def __dealloc__(self):
         if self._router != NULL:

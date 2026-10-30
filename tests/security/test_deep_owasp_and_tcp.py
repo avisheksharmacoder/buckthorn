@@ -385,3 +385,87 @@ def test_live_libuv_tcp_packet_fragmentation_and_concurrent_async():
             os.waitpid(pid, 0)
         except OSError:
             pass
+
+
+def test_patch_head_decorators_and_live_tcp_websocket_upgrade():
+    from buckthorn._core import encode_client_masked_ws_frame
+    from buckthorn.routing import APIRouter
+
+    app = Buckthorn()
+    router = APIRouter(prefix="/v1")
+
+    @router.patch("/items/{item_id}")
+    def patch_item(item_id: int, delta: int = Query(1)):
+        return {"patched_id": item_id, "delta": delta}
+
+    @router.head("/items/{item_id}", status_code=204)
+    def head_item(item_id: int):
+        return b""
+
+    app.include_router(router)
+
+    @app.websocket("/ws/live/{room}")
+    async def ws_live_room(ws, room: str):
+        await ws.accept()
+        msg = await ws.receive_text()
+        await ws.send_text(f"[{room}] echo:{msg}")
+        await ws.close()
+
+    # 1. Verify @router.patch and @router.head via RawTestClient
+    with RawTestClient(app) as client:
+        res_patch = client.send_raw(
+            b"PATCH /v1/items/42?delta=5 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        assert res_patch.status_code == 200
+        assert res_patch.json() == {"patched_id": 42, "delta": 5}
+
+        res_patch_helper = client.patch("/v1/items/42?delta=5")
+        assert res_patch_helper.status_code == 200
+        assert res_patch_helper.json() == {"patched_id": 42, "delta": 5}
+
+        res_head = client.send_raw(
+            b"HEAD /v1/items/42 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        assert res_head.status_code == 204
+
+        res_head_helper = client.head("/v1/items/42")
+        assert res_head_helper.status_code == 204
+
+    # 2. Verify Live TCP WebSocket 101 Upgrade + Masked RFC 6455 Frame Exchange
+    port = _find_free_port()
+    pid = os.fork()
+    if pid == 0:
+        app.run(host="127.0.0.1", port=port)
+        os._exit(0)
+
+    try:
+        for _ in range(50):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.02)
+
+        with socket.create_connection(("127.0.0.1", port), timeout=2.0) as sock:
+            upgrade_req = (
+                b"GET /ws/live/alpha HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            sock.sendall(upgrade_req)
+            hs_data = sock.recv(1024)
+            assert b"HTTP/1.1 101 Switching Protocols\r\n" in hs_data
+            assert b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" in hs_data
+
+            # Send masked client RFC 6455 text frame over the upgraded TCP socket
+            sock.sendall(encode_client_masked_ws_frame("buckthorn_v1_ready"))
+            frame_reply = sock.recv(1024)
+            assert b"[alpha] echo:buckthorn_v1_ready" in frame_reply
+    finally:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass

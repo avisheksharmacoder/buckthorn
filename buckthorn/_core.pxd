@@ -272,6 +272,22 @@ cdef extern from "c_src/bt_http.h" nogil:
     bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router)
     void bt_router_set_max_body_size(bt_router_t *router, size_t max_body_size)
 
+    int BT_WS_EVT_OPEN
+    int BT_WS_EVT_MESSAGE
+    int BT_WS_EVT_CLOSE
+
+    ctypedef int (*bt_ws_event_fn)(
+        void *router_ctx,
+        void *ws_client_ctx,
+        int event_type,
+        const char *path, size_t path_len,
+        const char *payload, size_t payload_len
+    )
+
+    void bt_router_set_ws_cb(bt_router_t *router, bt_ws_event_fn ws_cb, void *router_ctx)
+    int bt_uv_ws_send_frame(void *ws_client_ctx, const char *frame_buf, size_t frame_len)
+    void bt_uv_ws_close_client(void *ws_client_ctx)
+
 cdef extern from "c_src/bt_logger.h" nogil:
     enum:
         BT_LOG_LEVEL_DEBUG

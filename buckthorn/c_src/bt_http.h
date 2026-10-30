@@ -11,6 +11,7 @@
 #include "bt_logger.h"
 #include "bt_middleware.h"
 #include "bt_audit.h"
+#include "bt_realtime.h"
 
 #define BT_MAX_HEADERS 64
 #define BT_RESP_BUF_SIZE (64 * 1024)
@@ -21,8 +22,21 @@
 #define BT_HANDLER_ERROR -1
 #define BT_HANDLER_SUSPENDED 2
 
+/* WebSocket lifecycle events */
+#define BT_WS_EVT_OPEN       1
+#define BT_WS_EVT_MESSAGE    2
+#define BT_WS_EVT_CLOSE      3
+
 /* Callback invoked on every libuv tick when 1+ Python async tasks are in flight */
 typedef int (*bt_async_tick_fn)(void);
+
+typedef int (*bt_ws_event_fn)(
+    void *router_ctx,
+    void *ws_client_ctx,
+    int event_type,
+    const char *path, size_t path_len,
+    const char *payload, size_t payload_len
+);
 
 typedef int (*bt_handler_invoke_fn)(
     void *handler_obj,
@@ -56,6 +70,8 @@ typedef struct {
     rax *tree;
     bt_handler_invoke_fn invoke_cb;
     bt_async_tick_fn tick_cb;
+    bt_ws_event_fn ws_cb;
+    void *ws_ctx;
     size_t num_param_routes;
     bt_param_route_t param_routes[BT_MAX_PARAM_ROUTES];
     bt_logger_t *access_logger;
@@ -77,11 +93,15 @@ bt_router_t *bt_router_create(bt_handler_invoke_fn invoke_cb);
 void bt_router_destroy(bt_router_t *router);
 void bt_router_set_max_body_size(bt_router_t *router, size_t max_body_size);
 void bt_router_set_async_tick_cb(bt_router_t *router, bt_async_tick_fn tick_cb);
+void bt_router_set_ws_cb(bt_router_t *router, bt_ws_event_fn ws_cb, void *router_ctx);
 
 int bt_router_insert(bt_router_t *router, const char *method, size_t method_len,
                      const char *path, size_t path_len, void *handler_obj);
 void bt_router_set_access_logger(bt_router_t *router, bt_logger_t *logger);
 bt_middleware_chain_t *bt_router_get_mw(bt_router_t *router);
+
+int bt_uv_ws_send_frame(void *ws_client_ctx, const char *frame_buf, size_t frame_len);
+void bt_uv_ws_close_client(void *ws_client_ctx);
 
 /* Called by Cython when a suspended async route handler resolves on the event loop */
 void bt_uv_complete_async_request(

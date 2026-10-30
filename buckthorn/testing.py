@@ -165,6 +165,18 @@ class RawTestClient:
     def delete(self, path: str, headers: Optional[dict[str, str]] = None) -> RawResponse:
         return self.request("DELETE", path, headers=headers)
 
+    def patch(
+        self,
+        path: str,
+        body: bytes = b"",
+        headers: Optional[dict[str, str]] = None,
+        json: Optional[Any] = None,
+    ) -> RawResponse:
+        return self.request("PATCH", path, headers=headers, body=body, json=json)
+
+    def head(self, path: str, headers: Optional[dict[str, str]] = None) -> RawResponse:
+        return self.request("HEAD", path, headers=headers)
+
     def options(self, path: str, headers: Optional[dict[str, str]] = None) -> RawResponse:
         return self.request("OPTIONS", path, headers=headers)
 

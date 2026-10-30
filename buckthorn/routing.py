@@ -199,3 +199,47 @@ class APIRouter:
             )
             return fn
         return decorator
+
+    def patch(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+        dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
+    ):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(
+                path,
+                fn,
+                ["PATCH"],
+                response_model=response_model,
+                status_code=status_code,
+                dependencies=dependencies,
+                tags=tags,
+            )
+            return fn
+        return decorator
+
+    def head(
+        self,
+        path: str,
+        *,
+        response_model: Optional[Type[Schema]] = None,
+        status_code: int = 200,
+        dependencies: Optional[Sequence[DependsInfo]] = None,
+        tags: Optional[list[str]] = None,
+    ):
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.add_api_route(
+                path,
+                fn,
+                ["HEAD"],
+                response_model=response_model,
+                status_code=status_code,
+                dependencies=dependencies,
+                tags=tags,
+            )
+            return fn
+        return decorator
